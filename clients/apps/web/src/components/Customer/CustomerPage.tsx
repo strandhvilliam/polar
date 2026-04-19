@@ -217,7 +217,7 @@ export const CustomerPage: React.FC<CustomerPageProps> = ({
 
   return (
     <Tabs defaultValue="overview" className="flex flex-col">
-      <TabsList className="mb-8">
+      <TabsList className="mb-8 min-w-0 max-md:max-w-full max-md:justify-start max-md:overflow-x-auto">
         <TabsTrigger value="overview">Overview</TabsTrigger>
         <TabsTrigger value="events">Events</TabsTrigger>
         <TabsTrigger value="activity">Activity</TabsTrigger>
