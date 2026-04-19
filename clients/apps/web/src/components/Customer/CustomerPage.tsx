@@ -1,6 +1,7 @@
 'use client'
 
 import { BenefitGrantStatus } from '@/components/Benefit/BenefitGrantStatus'
+import { CustomerActivityTimelineView } from '@/components/Customer/CustomerActivityTimelineView'
 import { CustomerEventsView } from '@/components/Customer/CustomerEventsView'
 import { CustomerUsageView } from '@/components/Customer/CustomerUsageView'
 import { MembersSection } from '@/components/Customer/MembersSection'
@@ -219,6 +220,7 @@ export const CustomerPage: React.FC<CustomerPageProps> = ({
       <TabsList className="mb-8">
         <TabsTrigger value="overview">Overview</TabsTrigger>
         <TabsTrigger value="events">Events</TabsTrigger>
+        <TabsTrigger value="activity">Activity</TabsTrigger>
         <TabsTrigger value="usage">Usage</TabsTrigger>
         <TabsTrigger value="costs">Costs</TabsTrigger>
         {showMembersTab && <TabsTrigger value="members">Members</TabsTrigger>}
@@ -564,6 +566,11 @@ export const CustomerPage: React.FC<CustomerPageProps> = ({
         interval={interval}
       />
       <CustomerEventsView
+        customer={customer}
+        organization={organization}
+        dateRange={dateRange}
+      />
+      <CustomerActivityTimelineView
         customer={customer}
         organization={organization}
         dateRange={dateRange}
