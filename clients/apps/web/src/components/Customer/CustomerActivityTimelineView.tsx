@@ -2,7 +2,7 @@
 
 import { EmptyState } from '@/components/CustomerPortal/EmptyState'
 import { TimelineSpine } from '@/components/Customer/Timeline/TimelineSpine'
-import { useTimelineItems } from '@/components/Customer/Timeline/useTimelineItems'
+import { useTimelineItems } from '@/components/Customer/Timeline/buildTimelineItems'
 import { useInfiniteEvents } from '@/hooks/queries/events'
 import { useInViewport } from '@/hooks/utils'
 import { History } from 'lucide-react'

@@ -91,63 +91,67 @@ const buildCrossedRevenueMilestones = (
     variant: 'positive',
   }))
 
+export const buildTimelineItems = (
+  events: schemas['Event'][],
+): TimelineItem[] => {
+  const items: TimelineItem[] = []
+  let currentDateKey: string | null = null
+  let currentDateHeader: Extract<
+    TimelineItem,
+    { type: 'date-header' }
+  > | null = null
+  let cumulativeBilled = 0
+
+  for (const event of events) {
+    let milestoneIndex = 0
+    const dateKey = calendarDateKey(event.timestamp)
+    if (dateKey !== currentDateKey) {
+      currentDateHeader = {
+        type: 'date-header',
+        date: dateKey,
+        cumulativeBilled: { total: cumulativeBilled },
+      }
+      items.push(currentDateHeader)
+      currentDateKey = dateKey
+    }
+
+    const previousBilled = cumulativeBilled
+    cumulativeBilled += revenueDelta(event)
+    if (currentDateHeader) {
+      currentDateHeader.cumulativeBilled = { total: cumulativeBilled }
+    }
+
+    const lifecycleMilestone = buildLifecycleMilestone(event)
+    if (lifecycleMilestone) {
+      items.push({
+        type: 'milestone',
+        eventId: event.id,
+        index: milestoneIndex++,
+        milestone: lifecycleMilestone,
+      })
+    }
+
+    for (const milestone of buildCrossedRevenueMilestones(
+      previousBilled,
+      cumulativeBilled,
+      event.timestamp,
+    )) {
+      items.push({
+        type: 'milestone',
+        eventId: event.id,
+        index: milestoneIndex++,
+        milestone,
+      })
+    }
+
+    items.push({ type: 'event', event })
+  }
+
+  return items
+}
+
 export const useTimelineItems = (
   events: schemas['Event'][],
 ): TimelineItem[] => {
-  return useMemo(() => {
-    const items: TimelineItem[] = []
-    let currentDateKey: string | null = null
-    let currentDateHeader: Extract<
-      TimelineItem,
-      { type: 'date-header' }
-    > | null = null
-    let cumulativeBilled = 0
-
-    for (const event of events) {
-      let milestoneIndex = 0
-      const dateKey = calendarDateKey(event.timestamp)
-      if (dateKey !== currentDateKey) {
-        currentDateHeader = {
-          type: 'date-header',
-          date: dateKey,
-          cumulativeBilled: { total: cumulativeBilled },
-        }
-        items.push(currentDateHeader)
-        currentDateKey = dateKey
-      }
-
-      const previousBilled = cumulativeBilled
-      cumulativeBilled += revenueDelta(event)
-      if (currentDateHeader) {
-        currentDateHeader.cumulativeBilled = { total: cumulativeBilled }
-      }
-
-      const lifecycleMilestone = buildLifecycleMilestone(event)
-      if (lifecycleMilestone) {
-        items.push({
-          type: 'milestone',
-          eventId: event.id,
-          index: milestoneIndex++,
-          milestone: lifecycleMilestone,
-        })
-      }
-
-      for (const milestone of buildCrossedRevenueMilestones(
-        previousBilled,
-        cumulativeBilled,
-        event.timestamp,
-      )) {
-        items.push({
-          type: 'milestone',
-          eventId: event.id,
-          index: milestoneIndex++,
-          milestone,
-        })
-      }
-
-      items.push({ type: 'event', event })
-    }
-
-    return items
-  }, [events])
+  return useMemo(() => buildTimelineItems(events), [events])
 }

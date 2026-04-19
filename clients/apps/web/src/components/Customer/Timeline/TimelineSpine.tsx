@@ -8,7 +8,7 @@ import { TimelineDateHeader } from './TimelineDateHeader'
 import { TimelineEvent } from './TimelineEvent'
 import { TimelineMilestone } from './TimelineMilestone'
 import { TimelineSpineMarkerRow } from './TimelineSpineMarkerRow'
-import type { TimelineItem } from './useTimelineItems'
+import type { TimelineItem } from './buildTimelineItems'
 
 const renderItem = (
   item: TimelineItem,

@@ -1,6 +1,6 @@
 'use client'
 
-import type { Milestone } from './useTimelineItems'
+import type { Milestone } from './buildTimelineItems'
 import { cva } from 'class-variance-authority'
 
 const milestoneBadgeVariants = cva('text-xxs! rounded-sm px-2 py-1 font-mono', {
