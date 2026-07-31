@@ -102,6 +102,9 @@ class CustomerType(StrEnum):
     team = "team"
 
 
+EXTERNAL_ID_METADATA_KEY = "__external_id"  # Metadata key holding the original external ID of a deleted customer
+
+
 def _avatar_url_for_email(email: str) -> str:
     domain = email.split("@")[-1].lower()
 
@@ -143,6 +146,12 @@ class Customer(MetadataMixin, RecordModel):
             "ix_customers_search_vector",
             "search_vector",
             postgresql_using="gin",
+        ),
+        Index(
+            "ix_customers_deleted_at_id",
+            "deleted_at",
+            "id",
+            postgresql_where=text("deleted_at IS NOT NULL"),
         ),
         UniqueConstraint("organization_id", "external_id"),
         UniqueConstraint("organization_id", "short_id"),
@@ -192,6 +201,16 @@ class Customer(MetadataMixin, RecordModel):
     reference to the customer.
 
     For new customers, this field will be null.
+    """
+
+    first_user_event_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True, default=None
+    )
+    """
+    Timestamp of the earliest `user` event attributed to this customer.
+
+    Events can carry an `external_customer_id` before the customer exists, so this can
+    predate `created_at`. Null when the organization never ingested an event for them.
     """
 
     meters_dirtied_at: Mapped[datetime | None] = mapped_column(
@@ -416,7 +435,7 @@ class Customer(MetadataMixin, RecordModel):
             return self.external_id
         # We clear the external ID for soft-deleted customers,
         # but keep it in metadata
-        return self.user_metadata.get("__external_id")
+        return self.user_metadata.get(EXTERNAL_ID_METADATA_KEY)
 
 
 # ID generation algorithm based on https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c
@@ -458,7 +477,10 @@ customers_search_vector_update_function = PGFunction(
     BEGIN
         NEW.search_vector :=
             setweight(to_tsvector('simple', coalesce(NEW.name, '')), 'A') ||
-            setweight(to_tsvector('simple', coalesce(NEW.email, '')), 'A');
+            setweight(to_tsvector('simple', coalesce(NEW.email, '')), 'A') ||
+            setweight(to_tsvector('simple', coalesce(
+                regexp_replace(NEW.email, '[@._-]', ' ', 'g'), ''
+            )), 'B');
         RETURN NEW;
     END
     $$ LANGUAGE plpgsql;

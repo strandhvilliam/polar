@@ -46,8 +46,8 @@ async def payout_transfer(payout_id: uuid.UUID) -> None:
         # (deny/block/backoffice) and would otherwise pay out a payout the ledger
         # already reversed. FOR UPDATE serializes with cancel(), which locks the
         # same row.
-        payout = await repository.get_by_id_for_update(
-            payout_id, options=repository.get_eager_options()
+        payout = await repository.get_by_id(
+            payout_id, options=repository.get_eager_options(), for_update=True
         )
         if payout is None:
             raise PayoutDoesNotExist(payout_id)
@@ -72,7 +72,7 @@ async def trigger_payout(
     async with AsyncSessionMaker() as session:
         repository = PayoutRepository(session)
         payout = await repository.get_by_id(
-            payout_id, options=repository.get_eager_options()
+            payout_id, options=repository.get_eager_options(), for_update=True
         )
         if payout is None:
             raise PayoutDoesNotExist(payout_id)
@@ -128,15 +128,15 @@ async def cancel_account_payouts(account_id: uuid.UUID) -> None:
 
 @actor(actor_name="payout.cancel_held_payouts", priority=TaskPriority.LOW)
 async def cancel_held_payouts(
-    account_id: uuid.UUID, payout_account_id: uuid.UUID
+    account_id: uuid.UUID, payout_account_id: uuid.UUID | None = None
 ) -> None:
-    """Cancel only held payouts for an account when its payout account changes.
+    """Cancel only held payouts for an account.
 
-    Enqueued by ``set_payout_account`` on a swap: a held payout pins the payout
-    account it was created against, so releasing it later would transfer to the
-    stale account. Scoped to ``payout_account_id`` (the previous account) so a
-    held payout already created against the new account isn't canceled. Pending
-    payouts are left alone (their transfer may already be in flight).
+    On an onboarding reset, every held payout is canceled because the
+    organization leaves the review flow. On a payout-account swap, the cancel
+    is scoped to the previous payout account so a hold against the new account
+    is preserved. Pending payouts are always left alone because their transfer
+    may already be in flight.
     """
     async with AsyncSessionMaker() as session:
         await payout_service.cancel_account_payouts(

@@ -52,18 +52,15 @@ const TransactionsList = ({
       ),
       cell: (props) => {
         const datetime = props.getValue() as string
-        return (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <div className="truncate whitespace-nowrap">
-                <FormattedDateTime datetime={datetime} resolution="day" />
-              </div>
-            </TooltipTrigger>
-            <TooltipContent>
-              <FormattedDateTime datetime={datetime} resolution="time" />
-            </TooltipContent>
-          </Tooltip>
-        )
+        const parentCreatedAt = props.row.getParentRow()?.original.created_at
+        const isSameDayAsParent =
+          parentCreatedAt !== undefined &&
+          new Date(parentCreatedAt).toDateString() ===
+            new Date(datetime).toDateString()
+        if (isSameDayAsParent) {
+          return null
+        }
+        return <FormattedDateTime datetime={datetime} resolution="time" />
       },
     },
     {
@@ -80,7 +77,7 @@ const TransactionsList = ({
           return <TransactionMeta transaction={transaction} />
         } else if (transaction.platform_fee_type) {
           return (
-            <div className="flex gap-x-4">
+            <div className="flex gap-x-4 pl-6">
               <div className="flex flex-row items-center gap-x-2">
                 <span className="text-sm">→</span>
                 <h3 className="text-sm">
@@ -117,11 +114,11 @@ const TransactionsList = ({
 
         return (
           <div className="flex flex-row justify-end">
-            {paymentTransaction.presentment_currency !==
-            transaction.currency ? (
+            {amount !== 0 &&
+            paymentTransaction.presentment_currency !== transaction.currency ? (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <span className="underline decoration-dotted">
+                  <span className="dark:decoration-polar-500 underline decoration-gray-400 decoration-dashed decoration-1 underline-offset-4">
                     {formatCurrency('accounting')(amount, transaction.currency)}
                   </span>
                 </TooltipTrigger>
@@ -213,11 +210,11 @@ const TransactionsList = ({
 
         return (
           <div className="flex justify-end">
-            {paymentTransaction.presentment_currency !==
-            transaction.currency ? (
+            {paymentTransaction.tax_amount !== 0 &&
+            paymentTransaction.presentment_currency !== transaction.currency ? (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <span className="underline decoration-dotted">
+                  <span className="dark:decoration-polar-500 underline decoration-gray-400 decoration-dashed decoration-1 underline-offset-4">
                     {formatCurrency('accounting')(
                       -paymentTransaction.tax_amount,
                       transaction.currency,
@@ -287,6 +284,7 @@ const TransactionsList = ({
     {
       id: 'status',
       enableSorting: false,
+      size: 190,
       header: ({ column }) => (
         <DataTableColumnHeader
           column={column}
@@ -295,11 +293,14 @@ const TransactionsList = ({
         />
       ),
       cell: (props) => {
-        const transaction = props.row.original
+        const { row } = props
+        if (row.depth > 0) {
+          return null
+        }
         return (
-          <div className="flex justify-end">
+          <div className="flex justify-end whitespace-nowrap">
             <TransactionAvailabilityStatus
-              transaction={transaction}
+              transaction={row.original}
               delay={payoutTransactionDelay}
             />
           </div>

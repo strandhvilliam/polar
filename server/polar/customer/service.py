@@ -541,6 +541,26 @@ class CustomerService:
 
         return updated_customer
 
+    async def upgrade_to_team(
+        self, session: AsyncSession, customer: Customer
+    ) -> Customer:
+        """Upgrade a customer to the 'team' type for seat-based purchases.
+
+        One-way and idempotent: customers already on 'team' (or any non-individual
+        type) are left untouched. NULL type is treated as 'individual' (legacy
+        customers).
+        """
+        current_type = customer.type or CustomerType.individual
+        if current_type != CustomerType.individual:
+            return customer
+
+        repository = CustomerRepository.from_session(session)
+        return await repository.update(
+            customer,
+            update_dict={"type": CustomerType.team},
+            flush=True,
+        )
+
     async def delete(
         self,
         session: AsyncSession,
@@ -553,12 +573,14 @@ class CustomerService:
 
         await member_service.delete_by_customer(session, customer.id)
 
-        if anonymize:
-            # Anonymize also sets deleted_at
-            return await self.anonymize(session, customer)
-
         repository = CustomerRepository.from_session(session)
-        return await repository.soft_delete(customer)
+        customer = await repository.soft_delete(customer)
+
+        if anonymize:
+            # Scrub PII from the deleted customer
+            customer = await self.anonymize(session, customer)
+
+        return customer
 
     async def anonymize(
         self,
@@ -573,6 +595,10 @@ class CustomerService:
         - Preserving external_id and tax_id for legal/tax reasons
         - Preserving name for businesses (identified by having tax_id)
         - Keeping order and subscription records intact (invoices are immutable)
+
+        This only scrubs PII; it does not delete the customer. Callers wanting
+        both use `delete(..., anonymize=True)`, which anonymizes and then
+        soft-deletes.
 
         This is idempotent - calling it on an already-anonymized customer
         will return success without making changes.
@@ -608,9 +634,6 @@ class CustomerService:
 
         # Clear OAuth tokens
         update_dict["_oauth_accounts"] = {}
-
-        # Mark as deleted (soft-delete)
-        update_dict["deleted_at"] = utc_now()
 
         # Record anonymization timestamp in metadata
         user_metadata = dict(customer.user_metadata) if customer.user_metadata else {}

@@ -9,7 +9,7 @@ export const SettingsGroup: React.FC<React.PropsWithChildren> = ({
 )
 
 export interface SettingsGroupItemProps {
-  title: string
+  title: React.ReactNode
   description?: React.ReactNode
   vertical?: boolean
 }
@@ -43,13 +43,5 @@ export const SettingsGroupItem: React.FC<
         {children}
       </div>
     )}
-  </div>
-)
-
-export const SettingsGroupActions: React.FC<React.PropsWithChildren> = ({
-  children,
-}) => (
-  <div className="flex flex-col gap-4 p-4 md:flex-row md:items-center">
-    {children}
   </div>
 )

@@ -1,7 +1,6 @@
 'use client'
 
-import { useAuth } from '@/hooks'
-import { CONFIG } from '@/utils/config'
+import { useAuth, useLogout } from '@/hooks'
 import { Box } from '@polar-sh/orbit/Box'
 import { motion } from 'motion/react'
 import { ArrowLeft } from 'lucide-react'
@@ -10,6 +9,7 @@ import { useRouter } from 'next/navigation'
 import { useState, type ReactNode } from 'react'
 import LogoIcon from '../Brand/logos/LogoIcon'
 import { type APIPreviewStep, APIPreview } from './APIPreview'
+import { Text } from '@polar-sh/orbit'
 
 const STEPS = ['personal', 'business', 'product'] as const
 const STEP_ROUTES = [
@@ -35,6 +35,7 @@ export function OnboardingShell({
 }: OnboardingShellProps) {
   const router = useRouter()
   const { userOrganizations } = useAuth()
+  const logout = useLogout()
   const [hadOrgs] = useState(() => userOrganizations.length > 0)
   const currentIndex = step ? STEPS.indexOf(step) : -1
 
@@ -53,18 +54,29 @@ export function OnboardingShell({
         gap="l"
         color="text-tertiary"
       >
+        {hadOrgs && (
+          <Link
+            href="/dashboard"
+            className="dark:hover:text-polar-200 text-sm hover:text-gray-900"
+          >
+            Back to dashboard
+          </Link>
+        )}
+
         <Link
           href="/dashboard/account/preferences"
           className="dark:hover:text-polar-200 text-sm hover:text-gray-900"
         >
           User settings
         </Link>
-        <a
-          href={`${CONFIG.BASE_URL}/v1/auth/logout`}
-          className="dark:hover:text-polar-200 text-sm hover:text-gray-900"
+
+        <button
+          type="button"
+          onClick={logout}
+          className="dark:hover:text-polar-200 cursor-pointer text-sm hover:text-gray-900"
         >
           Log out
-        </a>
+        </button>
       </Box>
       <Box width="100%" maxWidth="60rem">
         {/* Left: form */}
@@ -120,24 +132,14 @@ export function OnboardingShell({
               </Box>
 
               <Box flexDirection="column" rowGap="m">
-                <h1 className="text-3xl font-bold text-gray-900 dark:text-white">
-                  {title}
-                </h1>
+                <Text variant="heading-s">{title}</Text>
                 {subtitle && (
-                  <p className="dark:text-polar-400 text-sm text-gray-500">
+                  <Text variant="body" color="muted">
                     {subtitle}
-                  </p>
+                  </Text>
                 )}
               </Box>
               {children}
-              {hadOrgs && (
-                <Link
-                  href="/dashboard"
-                  className="dark:text-polar-400 dark:hover:text-polar-200 text-center text-sm text-gray-500 hover:text-gray-900"
-                >
-                  Back to dashboard
-                </Link>
-              )}
             </Box>
           </motion.div>
         </Box>

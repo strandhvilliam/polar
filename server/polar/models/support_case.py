@@ -36,6 +36,19 @@ class SupportCaseType(StrEnum):
     # future: refund_request
 
 
+class DisputeWinReason(StrEnum):
+    """Why the merchant believes they should win the chargeback.
+
+    Collected on their counter submission to help support gather the right
+    evidence before submitting to the card network.
+    """
+
+    cardholder_withdrew = "cardholder_withdrew"
+    cardholder_refunded = "cardholder_refunded"
+    rightful_cardholder = "rightful_cardholder"
+    other = "other"
+
+
 class SupportCaseParticipantKind(StrEnum):
     platform = "platform"
     merchant = "merchant"
@@ -81,6 +94,8 @@ class SupportCaseMessageType(StrEnum):
     dispute_won = "dispute_won"
     dispute_lost = "dispute_lost"
     dispute_prevented = "dispute_prevented"
+    # the merchant's decision on a dispute (records the lifecycle in the thread)
+    merchant_accepted = "merchant_accepted"
 
 
 class SupportCase(RecordModel):
@@ -110,17 +125,16 @@ class SupportCase(RecordModel):
         StringEnum(SupportCaseType, length=32), nullable=False, index=True
     )
     # Denormalized from the case's domain object (the appeal's review, the
-    # dispute's order) so the owning org is one column read away. Nullable for
-    # now; backfilled and made NOT NULL once writers populate it.
-    organization_id: Mapped[UUID | None] = mapped_column(
+    # dispute's order) so the owning org is one column read away.
+    organization_id: Mapped[UUID] = mapped_column(
         Uuid,
         ForeignKey("organizations.id", ondelete="restrict"),
-        nullable=True,
+        nullable=False,
         index=True,
     )
 
     @declared_attr
-    def organization(cls) -> Mapped["Organization | None"]:
+    def organization(cls) -> Mapped["Organization"]:
         return relationship("Organization", lazy="raise")
 
     # Staff member currently handling the case (advisory; no exclusivity).
@@ -158,7 +172,10 @@ class SupportCase(RecordModel):
 class ReviewAppealSupportCase(SupportCase):
     """A support case handling an organization review appeal."""
 
-    __mapper_args__ = {"polymorphic_identity": SupportCaseType.review_appeal}
+    __mapper_args__ = {
+        "polymorphic_identity": SupportCaseType.review_appeal,
+        "polymorphic_load": "inline",
+    }
 
     organization_review_id: Mapped[UUID] = mapped_column(
         Uuid,
@@ -184,13 +201,24 @@ Index(
 class DisputeSupportCase(SupportCase):
     """A support case handling a payment dispute (chargeback)."""
 
-    __mapper_args__ = {"polymorphic_identity": SupportCaseType.dispute}
+    __mapper_args__ = {
+        "polymorphic_identity": SupportCaseType.dispute,
+        "polymorphic_load": "inline",
+    }
 
     dispute_id: Mapped[UUID] = mapped_column(
         Uuid,
         ForeignKey("disputes.id", ondelete="restrict"),
         nullable=True,
         default=None,
+    )
+
+    win_reason: Mapped[DisputeWinReason | None] = mapped_column(
+        StringEnum(DisputeWinReason), nullable=True, default=None
+    )
+
+    win_reason_other: Mapped[str | None] = mapped_column(
+        Text, nullable=True, default=None
     )
 
     @declared_attr
@@ -275,9 +303,6 @@ class SupportCaseParticipant(RecordModel):
         nullable=True,
         default=None,
     )
-    # UNUSED: never written or read yet. Reserved for per-participant unread
-    # state; the backoffice "awaiting reply" dot is derived from message order
-    # instead. Drop this column if no upcoming case feature claims it.
     last_read_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True, default=None
     )

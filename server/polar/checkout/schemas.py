@@ -40,9 +40,11 @@ from polar.kit.metadata import (
     MetadataOutputMixin,
 )
 from polar.kit.schemas import (
+    EmptyStrToNone,
     EmptyStrToNoneValidator,
     HttpUrlToStr,
     IDSchema,
+    Int32,
     Schema,
     SetSchemaReference,
     StripValidator,
@@ -125,6 +127,15 @@ EmbedOrigin = Annotated[
     ),
 ]
 
+_payment_method_type_description = (
+    "Payment method type selected by the customer in the checkout form, "
+    "e.g. `card`, `apple_pay` or `upi`."
+)
+PaymentMethodTypeInput = Annotated[
+    EmptyStrToNone,
+    Field(description=_payment_method_type_description),
+]
+
 _external_customer_id_description = (
     "ID of the customer in your system. "
     "If a matching customer exists on Polar, the resulting order "
@@ -196,19 +207,19 @@ class CheckoutCreateBase(
         default=False, description=_require_billing_address_description
     )
     amount: Amount | None = None
-    seats: int | None = Field(
+    seats: Int32 | None = Field(
         default=None,
         ge=1,
         le=10000,
         description="Predefined number of seats (works with seat-based pricing only)",
     )
-    min_seats: int | None = Field(
+    min_seats: Int32 | None = Field(
         default=None,
         ge=1,
         le=10000,
         description=("Minimum number of seats (works with seat-based pricing only)"),
     )
-    max_seats: int | None = Field(
+    max_seats: Int32 | None = Field(
         default=None,
         ge=1,
         le=10000,
@@ -361,7 +372,7 @@ class CheckoutUpdateBase(CustomFieldDataInputMixin, Schema):
         ),
     )
     amount: Amount | None = None
-    seats: int | None = Field(
+    seats: Int32 | None = Field(
         default=None,
         ge=1,
         le=10000,
@@ -404,6 +415,7 @@ class CheckoutUpdate(
 class CheckoutUpdatePublic(CheckoutUpdateBase):
     """Update an existing checkout session using the client secret."""
 
+    payment_method_type: PaymentMethodTypeInput = None
     discount_code: Annotated[str, StripValidator] | None = Field(
         default=None, description="Discount code to apply to the checkout."
     )
@@ -594,6 +606,9 @@ class CheckoutBase(CustomFieldDataOutputMixin, TimestampedSchema, IDSchema):
         validation_alias=AliasChoices("customer_tax_id_number", "customer_tax_id")
     )
     locale: str | None = None
+    payment_method_type: str | None = Field(
+        description=_payment_method_type_description
+    )
 
     payment_processor_metadata: dict[str, str]
 

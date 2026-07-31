@@ -45,11 +45,7 @@ SubscriptionRenewalReminder.PreviewProps = {
   email: 'john@example.com',
   organization,
   product,
-  subscription: {
-    id: '12345',
-    status: 'active',
-  },
-  renewal_date: '04/15/2026',
+  renewal_date: 'April 15, 2026',
   url: 'https://polar.sh/acme-inc/portal/subscriptions/12345',
 }
 

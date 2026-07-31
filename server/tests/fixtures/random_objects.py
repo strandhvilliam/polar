@@ -38,9 +38,11 @@ from polar.models import (
     CustomField,
     Discount,
     DiscountProduct,
+    DiscountRedemption,
     Dispute,
     Event,
     EventType,
+    File,
     IssueReward,
     LegacyRecurringProductPriceCustom,
     LegacyRecurringProductPriceFixed,
@@ -49,6 +51,7 @@ from polar.models import (
     Order,
     OrderItem,
     Organization,
+    OrganizationReview,
     Payment,
     PaymentMethod,
     Payout,
@@ -105,6 +108,7 @@ from polar.models.discount import (
 )
 from polar.models.dispute import DisputeAlertProcessor, DisputeStatus
 from polar.models.event import EventSource
+from polar.models.file import FileServiceTypes
 from polar.models.member import MemberRole
 from polar.models.notification_recipient import NotificationRecipient
 from polar.models.order import OrderBillingReasonInternal, OrderStatus
@@ -119,6 +123,14 @@ from polar.models.product_price import (
     SeatTierType,
 )
 from polar.models.subscription import SubscriptionStatus
+from polar.models.support_case import (
+    DisputeSupportCase,
+    ReviewAppealSupportCase,
+    SupportCase,
+    SupportCaseMessage,
+    SupportCaseMessageAuthorKind,
+    SupportCaseMessageType,
+)
 from polar.models.transaction import Processor, TransactionType
 from polar.models.user import OAuthAccount, OAuthPlatform
 from polar.models.user_organization import OrganizationRole
@@ -431,6 +443,8 @@ async def create_product(
     organization: Organization,
     recurring_interval: SubscriptionRecurringInterval | None,
     recurring_interval_count: int | None = 1,
+    meter_interval: SubscriptionRecurringInterval | None = None,
+    meter_interval_count: int | None = None,
     name: str = "Product",
     is_archived: bool = False,
     visibility: Visibility = Visibility.public,
@@ -443,12 +457,17 @@ async def create_product(
     recurring_interval_count = (
         None if recurring_interval is None else recurring_interval_count
     )
+    meter_interval_count = (
+        None if meter_interval is None else (meter_interval_count or 1)
+    )
     product = Product(
         name=name,
         description="Description",
         is_tax_applicable=is_tax_applicable,
         recurring_interval=recurring_interval,
         recurring_interval_count=recurring_interval_count,
+        meter_interval=meter_interval,
+        meter_interval_count=meter_interval_count,
         is_archived=is_archived,
         visibility=visibility,
         organization=organization,
@@ -661,12 +680,13 @@ async def create_product_fixed_and_seat(
     tiers: list[dict[str, typing.Any]] | None = None,
     seat_tier_type: SeatTierType = SeatTierType.volume,
     currency: str = "usd",
-    recurring_interval: SubscriptionRecurringInterval = (
+    recurring_interval: SubscriptionRecurringInterval | None = (
         SubscriptionRecurringInterval.month
     ),
 ) -> Product:
-    """Create a recurring product composing one fixed price with one seat price.
+    """Create a product composing one fixed price with one seat price.
 
+    Recurring by default; pass ``recurring_interval=None`` for a one-time product.
     Bills ``fixed_amount + seat_price.calculate_amount(seats)``. Pass ``tiers``
     (with ``seat_tier_type=graduated``) for a graduated seat schedule.
     """
@@ -767,6 +787,7 @@ async def create_discount(
     starts_at: datetime | None = None,
     ends_at: datetime | None = None,
     max_redemptions: int | None = None,
+    max_redemptions_per_customer: int | None = None,
     products: list[Product] | None = None,
 ) -> DiscountFixed: ...
 @typing.overload
@@ -783,6 +804,7 @@ async def create_discount(
     starts_at: datetime | None = None,
     ends_at: datetime | None = None,
     max_redemptions: int | None = None,
+    max_redemptions_per_customer: int | None = None,
     products: list[Product] | None = None,
 ) -> DiscountPercentage: ...
 async def create_discount(
@@ -799,6 +821,7 @@ async def create_discount(
     starts_at: datetime | None = None,
     ends_at: datetime | None = None,
     max_redemptions: int | None = None,
+    max_redemptions_per_customer: int | None = None,
     products: list[Product] | None = None,
 ) -> Discount:
     model = type.get_model()
@@ -813,6 +836,7 @@ async def create_discount(
         ends_at=ends_at,
         discount_products=[],
         max_redemptions=max_redemptions,
+        max_redemptions_per_customer=max_redemptions_per_customer,
         redemptions_count=0,
     )
     if isinstance(custom_field, DiscountFixed):
@@ -828,6 +852,22 @@ async def create_discount(
 
     await save_fixture(custom_field)
     return custom_field
+
+
+async def create_discount_redemption(
+    save_fixture: SaveFixture,
+    *,
+    discount: Discount,
+    checkout: Checkout | None = None,
+    subscription: Subscription | None = None,
+) -> DiscountRedemption:
+    discount_redemption = DiscountRedemption(
+        discount=discount,
+        checkout=checkout,
+        subscription=subscription,
+    )
+    await save_fixture(discount_redemption)
+    return discount_redemption
 
 
 @pytest_asyncio.fixture
@@ -2068,6 +2108,7 @@ async def create_event(
     source: EventSource = EventSource.user,
     name: str = METER_TEST_EVENT,
     timestamp: datetime | None = None,
+    ingested_at: datetime | None = None,
     customer: Customer | None = None,
     external_customer_id: str | None = None,
     external_id: str | None = None,
@@ -2082,6 +2123,7 @@ async def create_event(
     event = Event(
         id=event_id,
         timestamp=timestamp or utc_now(),
+        ingested_at=ingested_at or utc_now(),
         source=source,
         name=name,
         customer_id=customer.id if customer else None,
@@ -2336,11 +2378,12 @@ async def create_billing_entry(
             customer=customer,
         )
 
-    if start_timestamp is None:
-        start_timestamp = event.timestamp
-
-    if end_timestamp is None:
-        end_timestamp = event.timestamp
+    if type == BillingEntryType.cycle and subscription is not None:
+        start_timestamp = start_timestamp or subscription.current_period_start
+        end_timestamp = end_timestamp or subscription.current_period_end
+    else:
+        start_timestamp = start_timestamp or event.timestamp
+        end_timestamp = end_timestamp or event.timestamp
 
     billing_entry = BillingEntry(
         start_timestamp=start_timestamp,
@@ -2371,7 +2414,7 @@ async def create_customer_seat(
     metadata: dict[str, Any] | None = None,
     claimed_at: datetime | None = None,
     revoked_at: datetime | None = None,
-    member_id: uuid.UUID | None = None,
+    member: Member | None = None,
     email: str | None = None,
 ) -> CustomerSeat:
     if subscription is None and order is None:
@@ -2382,23 +2425,18 @@ async def create_customer_seat(
     if invitation_token is None and status == SeatStatus.pending:
         invitation_token = secrets.token_urlsafe(32)
 
-    seat_data: dict[str, Any] = {
-        "status": status,
-        "customer_id": customer.id if customer else None,
-        "invitation_token": invitation_token,
-        "claimed_at": claimed_at,
-        "revoked_at": revoked_at,
-        "seat_metadata": metadata or {},
-        "member_id": member_id,
-        "email": email,
-    }
-
-    if subscription is not None:
-        seat_data["subscription_id"] = subscription.id
-    elif order is not None:
-        seat_data["order_id"] = order.id
-
-    seat = CustomerSeat(**seat_data)
+    seat = CustomerSeat(
+        status=status,
+        customer_id=customer.id if customer else None,
+        invitation_token=invitation_token,
+        claimed_at=claimed_at,
+        revoked_at=revoked_at,
+        seat_metadata=metadata or {},
+        member=member,
+        email=email,
+        subscription=subscription,
+        order=order,
+    )
     await save_fixture(seat)
     return seat
 
@@ -2560,6 +2598,8 @@ async def create_dispute(
     payment_processor_id: str | None = "STRIPE_DISPUTE_ID",
     alert_processor: DisputeAlertProcessor | None = None,
     alert_processor_id: str | None = None,
+    evidence_due_by: datetime | None = None,
+    past_due: bool = False,
 ) -> Dispute:
     dispute = Dispute(
         status=status,
@@ -2570,8 +2610,123 @@ async def create_dispute(
         payment_processor_id=payment_processor_id,
         dispute_alert_processor=alert_processor,
         dispute_alert_processor_id=alert_processor_id,
+        evidence_due_by=evidence_due_by,
+        past_due=past_due,
         order=order,
         payment=payment,
     )
     await save_fixture(dispute)
     return dispute
+
+
+async def create_organization_review(
+    save_fixture: SaveFixture,
+    organization: Organization,
+    *,
+    verdict: OrganizationReview.Verdict = OrganizationReview.Verdict.FAIL,
+    risk_score: float = 90.0,
+    violated_sections: list[str] | None = None,
+    reason: str = "denied",
+    model_used: str = "test",
+    appeal_submitted_at: datetime | None = None,
+    appeal_reason: str | None = None,
+    appeal_reviewed_at: datetime | None = None,
+    appeal_decision: OrganizationReview.AppealDecision | None = None,
+) -> OrganizationReview:
+    review = OrganizationReview(
+        organization_id=organization.id,
+        verdict=verdict,
+        risk_score=risk_score,
+        violated_sections=violated_sections if violated_sections is not None else [],
+        reason=reason,
+        model_used=model_used,
+        appeal_submitted_at=appeal_submitted_at,
+        appeal_reason=appeal_reason,
+        appeal_reviewed_at=appeal_reviewed_at,
+        appeal_decision=appeal_decision,
+    )
+    await save_fixture(review)
+    return review
+
+
+async def _open_case(save_fixture: SaveFixture, case: SupportCase) -> None:
+    """Emit the ``opened`` lifecycle event every persisted case carries in
+    production (a case is never without one)."""
+    await save_fixture(
+        SupportCaseMessage(
+            case=case,
+            type=SupportCaseMessageType.opened,
+            author_kind=SupportCaseMessageAuthorKind.system,
+            audience=[],
+        )
+    )
+
+
+async def create_appeal_case(
+    save_fixture: SaveFixture,
+    organization: Organization,
+    *,
+    review: OrganizationReview | None = None,
+    opened: bool = True,
+) -> ReviewAppealSupportCase:
+    if review is None:
+        review = await create_organization_review(save_fixture, organization)
+    case = ReviewAppealSupportCase(
+        organization_review=review, organization=organization
+    )
+    await save_fixture(case)
+    if opened:
+        await _open_case(save_fixture, case)
+    return case
+
+
+async def create_dispute_case(
+    save_fixture: SaveFixture,
+    organization: Organization,
+    customer: Customer,
+    product: Product,
+    *,
+    opened: bool = True,
+    dispute_status: DisputeStatus = DisputeStatus.needs_response,
+    payment_processor_id: str | None = "STRIPE_DISPUTE_ID",
+    evidence_due_by: datetime | None = None,
+    past_due: bool = False,
+) -> DisputeSupportCase:
+    order = await create_order(save_fixture, customer=customer, product=product)
+    payment = await create_payment(save_fixture, organization, order=order)
+    dispute = await create_dispute(
+        save_fixture,
+        order,
+        payment,
+        status=dispute_status,
+        payment_processor_id=payment_processor_id,
+        evidence_due_by=evidence_due_by,
+        past_due=past_due,
+    )
+    case = DisputeSupportCase(dispute=dispute, organization=organization)
+    await save_fixture(case)
+    if opened:
+        await _open_case(save_fixture, case)
+    return case
+
+
+async def create_support_case_attachment_file(
+    save_fixture: SaveFixture,
+    organization: Organization,
+    *,
+    name: str = "evidence.pdf",
+    service: FileServiceTypes = FileServiceTypes.support_case_attachment,
+    is_uploaded: bool = True,
+) -> File:
+    file = File(
+        organization=organization,
+        name=name,
+        path=f"support_case_attachment/{name}",
+        mime_type="application/pdf",
+        size=1234,
+        service=service,
+        is_uploaded=is_uploaded,
+        is_enabled=True,
+    )
+    await save_fixture(file)
+    return file

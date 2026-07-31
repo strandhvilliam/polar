@@ -1,10 +1,11 @@
 import { usePostHog } from '@/hooks/posthog'
 import { AuthContext } from '@/providers/auth'
 import { api } from '@/utils/client'
+import { CONFIG } from '@/utils/config'
 import { schemas, unwrap } from '@polar-sh/client'
 import * as Sentry from '@sentry/nextjs'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { useContext, useEffect } from 'react'
+import { useCallback, useContext, useEffect } from 'react'
 
 export const useAuth = (): {
   authenticated: boolean
@@ -24,8 +25,15 @@ export const useAuth = (): {
   } = useContext(AuthContext)
 
   const reloadUser = async (): Promise<undefined> => {
-    const user = await unwrap(api.GET('/v1/users/me'))
-    setCurrentUser(user)
+    try {
+      const user = await unwrap(api.GET('/v1/users/me'))
+      setCurrentUser(user)
+      setUserOrganizations(user.organizations ?? [])
+    } catch (error) {
+      // Best-effort refresh: the user is re-seeded from middleware on the next
+      // navigation, so a failed reload is reported but never blocks the caller.
+      Sentry.captureException(error)
+    }
   }
 
   useEffect(() => {
@@ -50,24 +58,42 @@ export const useAuth = (): {
   }
 }
 
+export const useLogout = (): (() => void) => {
+  const posthog = usePostHog()
+
+  return useCallback(() => {
+    posthog.reset()
+    window.location.href = `${CONFIG.BASE_URL}/v1/auth/logout`
+  }, [posthog])
+}
+
 export const useAuthSessionStart = () =>
   useMutation({
     mutationFn: (return_to?: string) =>
       api.POST('/v1/auth/start', { body: { return_to } }),
   })
 
-export const useAuthSessionStatus = () => {
-  return useQuery({
-    queryKey: ['auth', 'session'],
-    queryFn: () => api.GET('/v1/auth/status'),
-    retry: false,
+export const useOrgAuthSessionStart = (slug: string) =>
+  useMutation({
+    mutationFn: (return_to?: string) =>
+      api.POST('/v1/auth/{slug}/start', {
+        params: { path: { slug } },
+        body: { return_to },
+      }),
   })
-}
 
 export const useEmailOTPRequest = () =>
   useMutation({
-    mutationFn: (email: string) =>
-      api.POST('/v1/auth/email-otp/request', { body: { email } }),
+    mutationFn: ({
+      email,
+      turnstileToken,
+    }: {
+      email: string
+      turnstileToken: string
+    }) =>
+      api.POST('/v1/auth/email-otp/request', {
+        body: { email, 'cf-turnstile-response': turnstileToken },
+      }),
   })
 
 export const useEmailOTPVerify = () =>

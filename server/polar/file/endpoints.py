@@ -12,6 +12,7 @@ from polar.exceptions import NotPermitted, ResourceNotFound
 from polar.kit.pagination import ListResource, PaginationParamsQuery
 from polar.kit.schemas import MultipleQueryFilter
 from polar.models import File
+from polar.models.file import FileServiceTypes
 from polar.openapi import APITag
 from polar.organization.resolver import get_payload_organization
 from polar.organization.schemas import OrganizationID
@@ -26,6 +27,7 @@ from polar.routing import APIRouter
 from . import auth
 from .schemas import (
     FileCreate,
+    FileDownload,
     FilePatch,
     FileRead,
     FileReadAdapter,
@@ -38,6 +40,16 @@ router = APIRouter(prefix="/files", tags=["files", APITag.public])
 
 FileID = Annotated[UUID4, Path(description="The file ID.")]
 FileNotFound = {"description": "File not found.", "model": ResourceNotFound.schema()}
+
+
+def _assert_mutable(file: File) -> None:
+    """Files attached to a support case are part of the case record — they are
+    created through this API but can't be modified or deleted through it."""
+    if file.service == FileServiceTypes.support_case_attachment:
+        raise NotPermitted(
+            "Support case attachments cannot be modified or deleted "
+            "through the files API."
+        )
 
 
 @router.get("/", summary="List Files", response_model=ListResource[FileRead])
@@ -65,6 +77,37 @@ async def list(
         count,
         pagination,
     )
+
+
+@router.get(
+    "/{id}/download",
+    summary="Get File Download",
+    tags=[APITag.private],
+    response_model=FileDownload,
+    responses={
+        403: {
+            "description": "You don't have the permission to download this file.",
+            "model": NotPermitted.schema(),
+        },
+        404: FileNotFound,
+    },
+)
+async def download(
+    id: FileID,
+    auth_subject: auth.FileRead,
+    session: AsyncReadSession = Depends(get_db_read_session),
+) -> FileDownload:
+    """Get a presigned URL to download a file."""
+    file = await file_service.get(session, auth_subject, id)
+    if file is None or not file.is_uploaded:
+        raise ResourceNotFound()
+
+    if file.service == FileServiceTypes.support_case_attachment:
+        raise NotPermitted(
+            "Support case attachments cannot be downloaded through the files API."
+        )
+
+    return file_service.generate_downloadable_schema(file)
 
 
 @router.post(
@@ -153,6 +196,7 @@ async def update(
     if file is None:
         raise ResourceNotFound()
 
+    _assert_mutable(file)
     await assert_resource_permission(
         session, auth_subject, file, OrganizationPermission.products_manage
     )
@@ -182,6 +226,7 @@ async def delete(
     if file is None:
         raise ResourceNotFound()
 
+    _assert_mutable(file)
     await assert_resource_permission(
         session, auth_subject, file, OrganizationPermission.products_manage
     )

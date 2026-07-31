@@ -27,6 +27,9 @@ from polar.checkout.service import (
     AlreadyActiveSubscriptionError,
     CheckoutCustomerDeleted,
     CheckoutCustomerExternalIdMismatch,
+    DiscountRedemptionLimitReached,
+    EmbedHostNotAllowed,
+    ExpiredCheckoutError,
     NotConfirmedCheckout,
     NotOpenCheckout,
     TrialAlreadyRedeemed,
@@ -65,14 +68,17 @@ from polar.models import (
     User,
     UserOrganization,
 )
-from polar.models.checkout import CheckoutStatus
+from polar.models.checkout import BillingAddressFieldMode, CheckoutStatus
 from polar.models.custom_field import CustomFieldType
 from polar.models.customer import CustomerType
 from polar.models.customer_seat import SeatStatus
 from polar.models.discount import DiscountDuration, DiscountType
 from polar.models.member import MemberRole
 from polar.models.order import OrderBillingReasonInternal, OrderStatus
-from polar.models.organization import OrganizationStatus
+from polar.models.organization import (
+    EMBED_HOSTS_ENFORCED_FROM,
+    OrganizationStatus,
+)
 from polar.models.product_price import (
     ProductPriceAmountType,
     ProductPriceCustom,
@@ -100,6 +106,7 @@ from polar.tax.tax_id import TaxIDFormat
 from polar.trial_redemption.repository import TrialRedemptionRepository
 from tests.fixtures.auth import AuthSubjectFixture
 from tests.fixtures.database import SaveFixture
+from tests.fixtures.embed_hosts import BEFORE_EMBED_CUTOFF
 from tests.fixtures.events import get_all_by_name
 from tests.fixtures.random_objects import (
     create_active_subscription,
@@ -109,8 +116,10 @@ from tests.fixtures.random_objects import (
     create_customer,
     create_customer_seat,
     create_discount,
+    create_discount_redemption,
     create_member,
     create_order,
+    create_payment,
     create_product,
     create_product_fixed_and_seat,
     create_product_price_fixed,
@@ -2561,6 +2570,144 @@ class TestCheckoutLinkCreate:
         assert checkout.success_url == "https://example.com/success"
         assert checkout.user_metadata == {"key": "value"}
 
+    async def test_dropped_embed_origin(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        product_one_time: Product,
+    ) -> None:
+        checkout_link = await create_checkout_link(
+            save_fixture, products=[product_one_time]
+        )
+
+        checkout = await checkout_service.checkout_link_create(
+            session, checkout_link, embed_origin="*"
+        )
+
+        assert checkout.embed_origin is None
+
+    async def test_normalized_embed_origin(
+        self,
+        embed_hosts_not_enforced: None,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+        product_one_time: Product,
+    ) -> None:
+        organization.created_at = BEFORE_EMBED_CUTOFF
+        await save_fixture(organization)
+        checkout_link = await create_checkout_link(
+            save_fixture, products=[product_one_time]
+        )
+
+        checkout = await checkout_service.checkout_link_create(
+            session, checkout_link, embed_origin="https://Example.com:443/"
+        )
+
+        assert checkout.embed_origin == "https://example.com"
+
+    async def test_allowed_embed_origin(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+        product_one_time: Product,
+    ) -> None:
+        organization.created_at = EMBED_HOSTS_ENFORCED_FROM
+        organization.embed_hosts = ["*.example.com"]
+        await save_fixture(organization)
+        checkout_link = await create_checkout_link(
+            save_fixture, products=[product_one_time]
+        )
+
+        checkout = await checkout_service.checkout_link_create(
+            session, checkout_link, embed_origin="https://www.example.com/checkout"
+        )
+
+        assert checkout.embed_origin == "https://www.example.com"
+
+    async def test_refused_embed_origin(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+        product_one_time: Product,
+    ) -> None:
+        organization.created_at = EMBED_HOSTS_ENFORCED_FROM
+        organization.embed_hosts = ["example.com"]
+        await save_fixture(organization)
+        checkout_link = await create_checkout_link(
+            save_fixture, products=[product_one_time]
+        )
+
+        with pytest.raises(EmbedHostNotAllowed):
+            await checkout_service.checkout_link_create(
+                session, checkout_link, embed_origin="https://evil.com"
+            )
+
+    async def test_unlisted_embed_origin_before_the_cutoff(
+        self,
+        embed_hosts_not_enforced: None,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+        product_one_time: Product,
+    ) -> None:
+        """Listing hosts doesn't enforce them: older organizations embed
+        unchecked until the cutoff applies to everyone."""
+        organization.created_at = BEFORE_EMBED_CUTOFF
+        organization.embed_hosts = ["example.com"]
+        await save_fixture(organization)
+        checkout_link = await create_checkout_link(
+            save_fixture, products=[product_one_time]
+        )
+
+        checkout = await checkout_service.checkout_link_create(
+            session, checkout_link, embed_origin="https://other.com"
+        )
+
+        assert checkout.embed_origin == "https://other.com"
+
+    async def test_refused_embed_origin_for_new_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+        product_one_time: Product,
+    ) -> None:
+        """An organization past the cutoff must configure a list before embedding."""
+        organization.created_at = EMBED_HOSTS_ENFORCED_FROM
+        await save_fixture(organization)
+        checkout_link = await create_checkout_link(
+            save_fixture, products=[product_one_time]
+        )
+
+        with pytest.raises(EmbedHostNotAllowed):
+            await checkout_service.checkout_link_create(
+                session, checkout_link, embed_origin="https://example.com"
+            )
+
+    async def test_dropped_embed_origin_when_enforced(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+        product_one_time: Product,
+    ) -> None:
+        """A value carrying no origin can't embed anyway, so it doesn't 403."""
+        organization.created_at = EMBED_HOSTS_ENFORCED_FROM
+        organization.embed_hosts = ["example.com"]
+        await save_fixture(organization)
+        checkout_link = await create_checkout_link(
+            save_fixture, products=[product_one_time]
+        )
+
+        checkout = await checkout_service.checkout_link_create(
+            session, checkout_link, embed_origin="null"
+        )
+
+        assert checkout.embed_origin is None
+
     async def test_valid_custom_price_honors_zero_prefill(
         self,
         save_fixture: SaveFixture,
@@ -2897,6 +3044,22 @@ class TestGetByClientSecret:
                 session, checkout_one_time_fixed.client_secret
             )
 
+    async def test_raises_expired_before_not_permitted_for_blocked_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        checkout_one_time_fixed: Checkout,
+    ) -> None:
+        checkout_one_time_fixed.expires_at = utc_now() - timedelta(days=1)
+        checkout_one_time_fixed.organization.set_status(OrganizationStatus.BLOCKED)
+        await save_fixture(checkout_one_time_fixed)
+        await save_fixture(checkout_one_time_fixed.organization)
+
+        with pytest.raises(ExpiredCheckoutError):
+            await checkout_service.get_by_client_secret(
+                session, checkout_one_time_fixed.client_secret
+            )
+
     async def test_raises_not_permitted_for_soft_deleted_organization(
         self,
         save_fixture: SaveFixture,
@@ -3063,6 +3226,48 @@ class TestUpdate:
                 ),
             )
 
+    async def test_discount_code_per_customer_limit_reached(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+        product: Product,
+        checkout_one_time_fixed: Checkout,
+    ) -> None:
+        discount = await create_discount(
+            save_fixture,
+            type=DiscountType.percentage,
+            basis_points=1000,
+            duration=DiscountDuration.once,
+            organization=organization,
+            code="LIMITEDPERCUSTOMER",
+            max_redemptions_per_customer=1,
+        )
+        prior_customer = await create_customer(
+            save_fixture, organization=organization, email="customer@example.com"
+        )
+        prior_checkout = await create_checkout(
+            save_fixture,
+            products=[product],
+            customer=prior_customer,
+            discount=discount,
+        )
+        prior_checkout.customer_email = "customer@example.com"
+        await save_fixture(prior_checkout)
+        await create_discount_redemption(
+            save_fixture, discount=discount, checkout=prior_checkout
+        )
+
+        with pytest.raises(DiscountRedemptionLimitReached):
+            await checkout_service.update(
+                session,
+                checkout_one_time_fixed,
+                CheckoutUpdatePublic(
+                    discount_code=discount.code,
+                    customer_email="customer@example.com",
+                ),
+            )
+
     async def test_invalid_discount_id_not_applicable(
         self,
         session: AsyncSession,
@@ -3103,7 +3308,7 @@ class TestUpdate:
             prices=[(4242, "usd")],
         )
         checkout_recurring_fixed.checkout_products.append(
-            CheckoutProduct(product=new_product, order=1)
+            CheckoutProduct(product=new_product, order=1, ad_hoc_prices=[])
         )
         await save_fixture(checkout_recurring_fixed)
 
@@ -3149,7 +3354,7 @@ class TestUpdate:
         )
 
         checkout_recurring_fixed.checkout_products.append(
-            CheckoutProduct(product=new_product, order=1)
+            CheckoutProduct(product=new_product, order=1, ad_hoc_prices=[])
         )
         checkout_recurring_fixed.discount = discount
         await save_fixture(checkout_recurring_fixed)
@@ -3193,7 +3398,7 @@ class TestUpdate:
         )
 
         checkout_recurring_fixed.checkout_products.append(
-            CheckoutProduct(product=new_product, order=1)
+            CheckoutProduct(product=new_product, order=1, ad_hoc_prices=[])
         )
         checkout_recurring_fixed.discount = discount
         await save_fixture(checkout_recurring_fixed)
@@ -3524,6 +3729,40 @@ class TestUpdate:
 
         assert checkout.custom_field_data == {"text": "abc"}
 
+    async def test_custom_field_data_preserved_when_unset(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        checkout_custom_fields: Checkout,
+    ) -> None:
+        checkout_custom_fields.custom_field_data = {"text": "abc", "select": "a"}
+        await save_fixture(checkout_custom_fields)
+
+        checkout = await checkout_service.update(
+            session,
+            checkout_custom_fields,
+            CheckoutUpdate(),
+        )
+
+        assert checkout.custom_field_data == {"text": "abc", "select": "a"}
+
+    async def test_custom_field_data_merged_on_partial_update(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        checkout_custom_fields: Checkout,
+    ) -> None:
+        checkout_custom_fields.custom_field_data = {"text": "abc", "select": "a"}
+        await save_fixture(checkout_custom_fields)
+
+        checkout = await checkout_service.update(
+            session,
+            checkout_custom_fields,
+            CheckoutUpdate(custom_field_data={"text": "updated"}),
+        )
+
+        assert checkout.custom_field_data == {"text": "updated", "select": "a"}
+
     async def test_valid_embed_origin(
         self,
         session: AsyncSession,
@@ -3637,6 +3876,40 @@ class TestUpdate:
 
         assert checkout.discount == discount_fixed_once
 
+    async def test_payment_method_updates_billing_address_fields(
+        self,
+        session: AsyncSession,
+        checkout_one_time_fixed: Checkout,
+    ) -> None:
+        checkout = await checkout_service.update(
+            session,
+            checkout_one_time_fixed,
+            CheckoutUpdatePublic(payment_method_type="upi"),
+        )
+
+        assert checkout.payment_method_type == "upi"
+        assert (
+            checkout.billing_address_fields["line1"] == BillingAddressFieldMode.required
+        )
+        assert (
+            checkout.billing_address_fields["city"] == BillingAddressFieldMode.required
+        )
+        assert (
+            checkout.billing_address_fields["postal_code"]
+            == BillingAddressFieldMode.required
+        )
+
+        checkout = await checkout_service.update(
+            session,
+            checkout,
+            CheckoutUpdatePublic(payment_method_type="card"),
+        )
+
+        assert checkout.payment_method_type == "card"
+        assert (
+            checkout.billing_address_fields["line1"] == BillingAddressFieldMode.disabled
+        )
+
     async def test_full_discount_resets_is_business_customer(
         self,
         save_fixture: SaveFixture,
@@ -3661,6 +3934,30 @@ class TestUpdate:
         assert checkout.discount == discount_percentage_100
         assert checkout.is_payment_form_required is False
         assert checkout.is_business_customer is False
+
+    async def test_full_discount_resets_payment_method(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        checkout_one_time_fixed: Checkout,
+        discount_percentage_100: Discount,
+    ) -> None:
+        checkout_one_time_fixed.payment_method_type = "upi"
+        await save_fixture(checkout_one_time_fixed)
+
+        assert checkout_one_time_fixed.is_billing_address_required is True
+
+        checkout = await checkout_service.update(
+            session,
+            checkout_one_time_fixed,
+            CheckoutUpdatePublic(
+                discount_code=discount_percentage_100.code,
+            ),
+        )
+
+        assert checkout.is_payment_form_required is False
+        assert checkout.payment_method_type is None
+        assert checkout.is_billing_address_required is False
 
     async def test_multiple_subscriptions_allowed(
         self,
@@ -4247,6 +4544,39 @@ class TestConfirm:
         for missing_field in missing_fields:
             assert ("body", *missing_field) in error_locations
 
+    async def test_full_billing_address_required_for_payment_method(
+        self,
+        stripe_service_mock: MagicMock,
+        session: AsyncSession,
+        auth_subject: AuthSubject[Anonymous],
+        checkout_one_time_fixed: Checkout,
+    ) -> None:
+        confirmation_token = MagicMock(spec=stripe_lib.ConfirmationToken)
+        confirmation_token.payment_method_preview = MagicMock()
+        confirmation_token.payment_method_preview.billing_details = MagicMock()
+        confirmation_token.payment_method_preview.billing_details.name = None
+        stripe_service_mock.get_confirmation_token.return_value = confirmation_token
+
+        with pytest.raises(PolarRequestValidationError) as e:
+            await checkout_service.confirm(
+                session,
+                auth_subject,
+                checkout_one_time_fixed,
+                CheckoutConfirmStripe.model_validate(
+                    {
+                        "confirmation_token_id": "CONFIRMATION_TOKEN_ID",
+                        "customer_name": "Customer Name",
+                        "customer_email": "customer@example.com",
+                        "payment_method_type": "upi",
+                        "customer_billing_address": {"country": "IN"},
+                    }
+                ),
+            )
+
+        errors = e.value.errors()
+        error_locations = {error["loc"] for error in errors}
+        assert ("body", "customer_billing_address") in error_locations
+
     async def test_wallet_name_from_confirmation_token(
         self,
         save_fixture: SaveFixture,
@@ -4791,6 +5121,86 @@ class TestConfirm:
         assert len(updated_discount.discount_redemptions) == 1
         assert updated_discount.discount_redemptions[0].checkout_id == checkout.id
 
+    async def test_full_discount_resets_payment_method(
+        self,
+        save_fixture: SaveFixture,
+        stripe_service_mock: MagicMock,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        auth_subject: AuthSubject[Anonymous],
+        checkout_one_time_fixed: Checkout,
+        discount_percentage_100: Discount,
+    ) -> None:
+        enqueue_job_mock = mocker.patch("polar.checkout.service.enqueue_job")
+
+        checkout_one_time_fixed.payment_method_type = "upi"
+        await save_fixture(checkout_one_time_fixed)
+
+        assert checkout_one_time_fixed.is_billing_address_required is True
+
+        stripe_service_mock.create_customer.return_value = SimpleNamespace(
+            id="STRIPE_CUSTOMER_ID"
+        )
+
+        checkout = await checkout_service.confirm(
+            session,
+            auth_subject,
+            checkout_one_time_fixed,
+            CheckoutConfirmStripe.model_validate(
+                {
+                    "customer_name": "Customer Name",
+                    "customer_email": "customer@example.com",
+                    "customer_billing_address": {"country": "IN"},
+                    "discount_code": discount_percentage_100.code,
+                }
+            ),
+        )
+
+        assert checkout.status == CheckoutStatus.confirmed
+        assert checkout.is_payment_form_required is False
+        assert checkout.payment_method_type is None
+        assert checkout.is_billing_address_required is False
+
+        stripe_service_mock.create_payment_intent.assert_not_called()
+        enqueue_job_mock.assert_called_once_with(
+            "checkout.handle_free_success", checkout_id=checkout.id
+        )
+
+    async def test_full_discount_resets_is_business_customer(
+        self,
+        save_fixture: SaveFixture,
+        stripe_service_mock: MagicMock,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        auth_subject: AuthSubject[Anonymous],
+        checkout_one_time_fixed: Checkout,
+        discount_percentage_100: Discount,
+    ) -> None:
+        mocker.patch("polar.checkout.service.enqueue_job")
+
+        checkout_one_time_fixed.is_business_customer = True
+        await save_fixture(checkout_one_time_fixed)
+
+        stripe_service_mock.create_customer.return_value = SimpleNamespace(
+            id="STRIPE_CUSTOMER_ID"
+        )
+
+        checkout = await checkout_service.confirm(
+            session,
+            auth_subject,
+            checkout_one_time_fixed,
+            CheckoutConfirmStripe.model_validate(
+                {
+                    "customer_name": "Customer Name",
+                    "customer_email": "customer@example.com",
+                    "discount_code": discount_percentage_100.code,
+                }
+            ),
+        )
+
+        assert checkout.status == CheckoutStatus.confirmed
+        assert checkout.is_business_customer is False
+
     async def test_valid_custom_pricing_discount(
         self,
         stripe_service_mock: MagicMock,
@@ -5026,6 +5436,50 @@ class TestConfirm:
         update_call = stripe_service_mock.update_customer.call_args
         assert update_call.kwargs.get("name") == "ACME Corp Inc."
 
+    async def test_existing_customer_without_name_gets_cardholder_name(
+        self,
+        save_fixture: SaveFixture,
+        stripe_service_mock: MagicMock,
+        session: AsyncSession,
+        auth_subject: AuthSubject[Anonymous],
+        organization: Organization,
+        checkout_one_time_fixed: Checkout,
+    ) -> None:
+        customer = await create_customer(
+            save_fixture,
+            organization=organization,
+            stripe_customer_id="CHECKOUT_CUSTOMER_ID",
+        )
+        customer.name = None
+        await save_fixture(customer)
+        checkout_one_time_fixed.customer = customer
+        checkout_one_time_fixed.customer_email = customer.email
+        await save_fixture(checkout_one_time_fixed)
+
+        stripe_service_mock.create_payment_intent.return_value = SimpleNamespace(
+            client_secret="CLIENT_SECRET", status="succeeded"
+        )
+
+        checkout = await checkout_service.confirm(
+            session,
+            auth_subject,
+            checkout_one_time_fixed,
+            CheckoutConfirmStripe.model_validate(
+                {
+                    "confirmation_token_id": "CONFIRMATION_TOKEN_ID",
+                    "customer_name": "John Smith",
+                    "customer_billing_address": {"country": "FR"},
+                }
+            ),
+        )
+
+        assert checkout.status == CheckoutStatus.confirmed
+        assert checkout.customer is not None
+        # An existing customer with no name yet gets an initial value from the
+        # cardholder name, so billing_name resolves and invoices can generate.
+        assert checkout.customer.name == "John Smith"
+        assert checkout.customer.billing_name == "John Smith"
+
     async def test_valid_stripe_existing_customer_email(
         self,
         save_fixture: SaveFixture,
@@ -5245,6 +5699,158 @@ class TestConfirm:
                         "confirmation_token_id": "CONFIRMATION_TOKEN_ID",
                         "customer_name": "Customer Name",
                         "customer_email": email,
+                        "customer_billing_address": {"country": "FR"},
+                    }
+                ),
+            )
+
+    async def test_discount_per_customer_limit_reached(
+        self,
+        save_fixture: SaveFixture,
+        stripe_service_mock: MagicMock,
+        session: AsyncSession,
+        auth_subject: AuthSubject[Anonymous],
+        organization: Organization,
+        product: Product,
+    ) -> None:
+        discount = await create_discount(
+            save_fixture,
+            type=DiscountType.fixed,
+            amounts={"usd": 1000},
+            duration=DiscountDuration.once,
+            organization=organization,
+            code="LIMITEDPERCUSTOMER",
+            max_redemptions_per_customer=1,
+        )
+
+        # The same customer already redeemed this discount once.
+        existing_customer = await create_customer(
+            save_fixture, organization=organization, email="customer@example.com"
+        )
+        prior_checkout = await create_checkout(
+            save_fixture,
+            products=[product],
+            customer=existing_customer,
+            discount=discount,
+        )
+        prior_checkout.customer_email = "customer@example.com"
+        await save_fixture(prior_checkout)
+        await create_discount_redemption(
+            save_fixture, discount=discount, checkout=prior_checkout
+        )
+
+        checkout = await create_checkout(
+            save_fixture, products=[product], discount=discount
+        )
+
+        confirmation_token = MagicMock(spec=stripe_lib.ConfirmationToken)
+        confirmation_token.payment_method_preview = MagicMock()
+        confirmation_token.payment_method_preview.billing_details = MagicMock()
+        confirmation_token.payment_method_preview.billing_details.name = "Customer Name"
+        confirmation_token.payment_method_preview.card = SimpleNamespace(
+            fingerprint="FINGERPRINT"
+        )
+        stripe_service_mock.get_confirmation_token.return_value = confirmation_token
+        stripe_service_mock.create_customer.return_value = SimpleNamespace(
+            id="STRIPE_CUSTOMER_ID"
+        )
+        stripe_service_mock.create_payment_intent.return_value = SimpleNamespace(
+            client_secret="CLIENT_SECRET", status="succeeded"
+        )
+        stripe_service_mock.create_setup_intent.return_value = SimpleNamespace(
+            client_secret="CLIENT_SECRET", status="succeeded"
+        )
+
+        with pytest.raises(DiscountRedemptionLimitReached):
+            await checkout_service.confirm(
+                session,
+                auth_subject,
+                checkout,
+                CheckoutConfirmStripe.model_validate(
+                    {
+                        "confirmation_token_id": "CONFIRMATION_TOKEN_ID",
+                        "customer_name": "Customer Name",
+                        "customer_email": "customer@example.com",
+                        "customer_billing_address": {"country": "FR"},
+                    }
+                ),
+            )
+
+    async def test_discount_per_customer_limit_reached_by_fingerprint(
+        self,
+        save_fixture: SaveFixture,
+        stripe_service_mock: MagicMock,
+        session: AsyncSession,
+        auth_subject: AuthSubject[Anonymous],
+        organization: Organization,
+        product: Product,
+    ) -> None:
+        discount = await create_discount(
+            save_fixture,
+            type=DiscountType.fixed,
+            amounts={"usd": 1000},
+            duration=DiscountDuration.once,
+            organization=organization,
+            code="LIMITEDPERCUSTOMER",
+            max_redemptions_per_customer=1,
+        )
+
+        # Different email, but the same card fingerprint as the prior redemption.
+        prior_customer = await create_customer(
+            save_fixture, organization=organization, email="other@example.com"
+        )
+        prior_checkout = await create_checkout(
+            save_fixture,
+            products=[product],
+            customer=prior_customer,
+            discount=discount,
+        )
+        prior_checkout.customer_email = "other@example.com"
+        await save_fixture(prior_checkout)
+        await create_payment(
+            save_fixture,
+            organization,
+            checkout=prior_checkout,
+            method_metadata={"fingerprint": "FINGERPRINT"},
+        )
+        await create_discount_redemption(
+            save_fixture, discount=discount, checkout=prior_checkout
+        )
+
+        checkout = await create_checkout(
+            save_fixture, products=[product], discount=discount
+        )
+
+        confirmation_token = MagicMock(spec=stripe_lib.ConfirmationToken)
+        confirmation_token.payment_method_preview = MagicMock()
+        confirmation_token.payment_method_preview.billing_details = MagicMock()
+        confirmation_token.payment_method_preview.billing_details.name = "Customer Name"
+        confirmation_token.payment_method_preview.card = SimpleNamespace(
+            fingerprint="FINGERPRINT"
+        )
+        stripe_service_mock.get_confirmation_token.return_value = confirmation_token
+        stripe_service_mock.create_customer.return_value = SimpleNamespace(
+            id="STRIPE_CUSTOMER_ID"
+        )
+        stripe_service_mock.create_payment_intent.return_value = SimpleNamespace(
+            client_secret="CLIENT_SECRET", status="succeeded"
+        )
+        stripe_service_mock.create_setup_intent.return_value = SimpleNamespace(
+            client_secret="CLIENT_SECRET", status="succeeded"
+        )
+
+        # `customer_name` is set, so the token is only fetched because the discount
+        # carries a per-customer limit.
+        with pytest.raises(DiscountRedemptionLimitReached):
+            await checkout_service.confirm(
+                session,
+                auth_subject,
+                checkout,
+                CheckoutConfirmStripe.model_validate(
+                    {
+                        "confirmation_token_id": "CONFIRMATION_TOKEN_ID",
+                        "customer_name": "Customer Name",
+                        "customer_email": "unrelated@example.com",
                         "customer_billing_address": {"country": "FR"},
                     }
                 ),

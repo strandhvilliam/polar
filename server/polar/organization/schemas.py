@@ -1,7 +1,7 @@
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlparse
 
 from pydantic import (
@@ -16,7 +16,7 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema
 from pydantic.networks import HttpUrl
 
-from polar.auth.permission import OrganizationPermission
+from polar.auth.permission import ROLE_PERMISSIONS, OrganizationPermission
 from polar.config import settings
 from polar.enums import SubscriptionProrationBehavior, TaxBehaviorOption
 from polar.kit.address import CountryAlpha2, CountryAlpha2Input
@@ -28,7 +28,6 @@ from polar.kit.schemas import (
     IDSchema,
     MergeJSONSchema,
     Schema,
-    SelectorWidget,
     SlugValidator,
     TimestampedSchema,
 )
@@ -37,17 +36,19 @@ from polar.models.organization import (
     OrganizationCustomerPortalSettings,
     OrganizationStatus,
     OrganizationSubscriptionSettings,
+    resolve_default_customer_email_settings,
 )
 from polar.models.organization_review import OrganizationReview
+from polar.models.support_case import ReviewAppealSupportCase
 from polar.models.user_organization import (
     OrganizationNotificationSettings,
     OrganizationRole,
 )
+from polar.organization.embed_hosts import InvalidEmbedHost, validate_host_pattern
 
 OrganizationID = Annotated[
     UUID4,
     MergeJSONSchema({"description": "The organization ID."}),
-    SelectorWidget("/v1/organizations", "Organization", "name"),
     Field(examples=[ORGANIZATION_ID_EXAMPLE]),
 ]
 
@@ -68,6 +69,38 @@ NameInput = Annotated[
     str,
     StringConstraints(min_length=3),
     AfterValidator(validate_blocked_words),
+]
+
+
+def validate_embed_hosts(value: list[str]) -> list[str]:
+    hosts: list[str] = []
+    for entry in value:
+        try:
+            host = validate_host_pattern(entry)
+        except InvalidEmbedHost as e:
+            raise ValueError(str(e)) from e
+        if host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+_embed_hosts_description = (
+    "Hosts allowed to embed this organization's checkout. "
+    "An entry is a host and an optional port, without a scheme: HTTPS is always "
+    "allowed, and HTTP too for local hosts — `localhost`, any `.localhost` or "
+    "`.local` name, and loopback or private addresses. "
+    "`*.example.com` matches any subdomain, but not `example.com` itself. "
+    "An app origin such as `chrome-extension://abcdef` carries its scheme, "
+    "having no host to match on."
+)
+
+EmbedHostsInput = Annotated[
+    list[str],
+    AfterValidator(validate_embed_hosts),
+    Field(
+        description=_embed_hosts_description,
+        examples=[["example.com", "*.example.com", "localhost:3000"]],
+    ),
 ]
 
 
@@ -172,6 +205,28 @@ class OrganizationFeatureSettings(Schema):
     preview_access_enabled: bool = Field(
         False,
         description="If this organization has preview access to new features enabled",
+    )
+    disputes_enabled: bool = Field(
+        False,
+        description="If this organization has the disputes dashboard enabled",
+    )
+    sso_enabled: bool = Field(
+        False,
+        description="If this organization has single sign-on configuration enabled",
+    )
+    compass_enabled: bool = Field(
+        False,
+        description=(
+            "If this organization has the split product navigation "
+            "(Billing / Compass / Customers) enabled in the dashboard"
+        ),
+    )
+    merchant_migration_enabled: bool = Field(
+        False,
+        description=(
+            "If this organization can migrate its billing from another "
+            "provider (e.g. Stripe) to Polar."
+        ),
     )
 
 
@@ -306,6 +361,18 @@ class OrganizationSocialLink(Schema):
         return data
 
 
+def _merge_customer_email_settings_defaults(value: Any) -> Any:
+    if isinstance(value, dict):
+        return resolve_default_customer_email_settings(value)
+    return value
+
+
+CustomerEmailSettings = Annotated[
+    OrganizationCustomerEmailSettings,
+    BeforeValidator(_merge_customer_email_settings_defaults),
+]
+
+
 class OrganizationBase(IDSchema, TimestampedSchema):
     name: str = Field(
         description="Organization name shown in checkout, customer portal, emails etc.",
@@ -370,6 +437,7 @@ class LegacyOrganizationStatus(StrEnum):
             OrganizationStatus.ACTIVE: LegacyOrganizationStatus.ACTIVE,
             OrganizationStatus.BLOCKED: LegacyOrganizationStatus.DENIED,
             OrganizationStatus.OFFBOARDING: LegacyOrganizationStatus.ACTIVE,
+            OrganizationStatus.OFFBOARDED: LegacyOrganizationStatus.DENIED,
         }
         try:
             return mapping[status]
@@ -392,7 +460,7 @@ class OrganizationPublicBase(OrganizationBase):
 
     feature_settings: SkipJsonSchema[OrganizationFeatureSettings | None]
     subscription_settings: SkipJsonSchema[OrganizationSubscriptionSettings]
-    customer_email_settings: SkipJsonSchema[OrganizationCustomerEmailSettings]
+    customer_email_settings: SkipJsonSchema[CustomerEmailSettings]
 
 
 class Organization(OrganizationBase):
@@ -404,6 +472,17 @@ class Organization(OrganizationBase):
     status: OrganizationStatus = Field(description="Current organization status")
     details_submitted_at: datetime | None = Field(
         description="When the business details were submitted for review.",
+    )
+    onboarding_resubmission_requested_at: datetime | None = Field(
+        description=(
+            "When Polar requested that the organization review and resubmit "
+            "its onboarding information, if applicable."
+        ),
+    )
+    sso_enforced: bool = Field(
+        description=(
+            "Whether members must access this organization through its SSO connection."
+        ),
     )
 
     default_presentment_currency: str = Field(
@@ -422,11 +501,19 @@ class Organization(OrganizationBase):
     subscription_settings: OrganizationSubscriptionSettings = Field(
         description="Settings related to subscriptions management",
     )
-    customer_email_settings: OrganizationCustomerEmailSettings = Field(
+    customer_email_settings: CustomerEmailSettings = Field(
         description="Settings related to customer emails",
     )
     customer_portal_settings: OrganizationCustomerPortalSettings = Field(
         description="Settings related to the customer portal",
+    )
+    embed_hosts: list[str] = Field(description=_embed_hosts_description)
+    embed_hosts_enforced: bool = Field(
+        description=(
+            "Whether an embedding page's origin must match `embed_hosts`. "
+            "Organizations that have not configured a list yet embed unchecked "
+            "until the allowlist is enforced for everyone."
+        ),
     )
     country: CountryAlpha2 | None = Field(
         None, description="Two-letter country code (ISO 3166-1 alpha-2)."
@@ -458,6 +545,9 @@ class OrganizationWithRole(Organization):
     includes the user's role on the organization."""
 
     role: OrganizationRole = Field(description="The user's role on this organization.")
+    permissions: list[OrganizationPermission] = Field(
+        description="The permissions the user's role grants on this organization."
+    )
 
     @classmethod
     def from_organization(
@@ -465,7 +555,11 @@ class OrganizationWithRole(Organization):
     ) -> "OrganizationWithRole":
         """Build from a SQLAlchemy `Organization` plus the user's role."""
         return cls.model_validate(
-            {**Organization.model_validate(organization).model_dump(), "role": role}
+            {
+                **Organization.model_validate(organization).model_dump(),
+                "role": role,
+                "permissions": sorted(ROLE_PERMISSIONS[role]),
+            }
         )
 
 
@@ -475,6 +569,36 @@ class OrganizationRoleDefinition(Schema):
     id: OrganizationRole = Field(description="The role identifier.")
     permissions: list[OrganizationPermission] = Field(
         description="The permissions this role grants in the organization."
+    )
+
+
+class OrganizationUncoveredHost(Schema):
+    host: str = Field(description="The entry that would admit this origin.")
+    origin: str = Field(description="The origin seen embedding the checkout.")
+    checkouts: int = Field(description="Embedded checkouts opened from this origin.")
+    last_seen_at: datetime = Field(description="When it last opened one.")
+
+
+class OrganizationEmbedStatus(Schema):
+    has_embedded: bool = Field(
+        description="Whether this organization has ever opened an embedded checkout."
+    )
+    embed_hosts: list[str] = Field(description=_embed_hosts_description)
+    embed_hosts_enforced: bool = Field(
+        description="Whether an embedding page's origin must match `embed_hosts`."
+    )
+    shared_hosts: list[str] = Field(
+        description=(
+            "Entries of `embed_hosts` admitting every tenant of a platform, "
+            "such as `*.vercel.app`."
+        )
+    )
+    uncovered_hosts: list[OrganizationUncoveredHost] = Field(
+        description=(
+            "Hosts seen embedding this organization's checkout that `embed_hosts` "
+            "would refuse. Anyone can name an origin when they create a checkout, "
+            "so these are observations, not hosts we vouch for."
+        )
     )
 
 
@@ -559,11 +683,20 @@ class OrganizationUpdate(Schema):
     subscription_settings: OrganizationSubscriptionSettings | None = None
     customer_email_settings: OrganizationCustomerEmailSettings | None = None
     customer_portal_settings: OrganizationCustomerPortalSettings | None = None
+    embed_hosts: EmbedHostsInput | None = None
     default_presentment_currency: PresentmentCurrency | None = Field(
         None, description="Default presentment currency for the organization"
     )
     default_tax_behavior: TaxBehaviorOption | None = Field(
         None, description="Default tax behavior applied on products."
+    )
+    sso_enforced: bool | None = Field(
+        None,
+        description=(
+            "Whether members must access this organization through its SSO "
+            "connection. Turning this on requires an active SSO session for "
+            "this organization and at least one enabled SSO connection."
+        ),
     )
 
 
@@ -583,7 +716,7 @@ class OrganizationReviewSubmission(Schema):
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
     website: Annotated[str, StringConstraints(min_length=1)]
     email: EmailStrDNS
-    socials: list[OrganizationSocialLink] = Field(min_length=1)
+    socials: list[OrganizationSocialLink] = Field(default_factory=list)
     details: Annotated[
         OrganizationReviewSubmissionDetails,
         BeforeValidator(_empty_review_submission_details_to_dict),
@@ -600,6 +733,13 @@ class OrganizationPaymentStatus(Schema):
     )
     organization_status: OrganizationStatus = Field(
         description="Current organization status"
+    )
+    onboarding_resubmission_requested_at: datetime | None = Field(
+        description=(
+            "When Polar requested that the organization review and resubmit "
+            "its onboarding information, if applicable. Null for organizations "
+            "that have never been reset for review."
+        ),
     )
 
 
@@ -634,6 +774,24 @@ class OrganizationReviewStatus(Schema):
     appeal_reviewed_at: datetime | None = Field(
         default=None, description="When appeal was reviewed"
     )
+    appeal_case_id: UUID4 | None = Field(
+        default=None,
+        description="ID of the human-review support case, if one was opened",
+    )
+
+    @classmethod
+    def from_review(
+        cls, review: OrganizationReview, case: ReviewAppealSupportCase | None
+    ) -> Self:
+        return cls(
+            verdict=review.verdict,  # type: ignore[arg-type]
+            reason=review.reason,
+            appeal_submitted_at=review.appeal_submitted_at,
+            appeal_reason=review.appeal_reason,
+            appeal_decision=review.appeal_decision,
+            appeal_reviewed_at=review.appeal_reviewed_at,
+            appeal_case_id=case.id if case is not None else None,
+        )
 
 
 class OrganizationReviewCheckKey(StrEnum):
@@ -662,6 +820,7 @@ class OrganizationReviewCheckReason(StrEnum):
 
     # Universal
     NOT_STARTED = "not_started"
+    NOT_AUTHORIZED = "not_authorized"
     IN_PROGRESS = "in_progress"
     EXTERNAL_PENDING = "external_pending"
 

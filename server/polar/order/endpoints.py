@@ -1,7 +1,8 @@
 from collections.abc import AsyncGenerator
+from datetime import datetime
+from textwrap import dedent
 
 from fastapi import Depends, Query, Response
-from fastapi.responses import StreamingResponse
 from pydantic import UUID4
 
 from polar.auth.permission import OrganizationPermission
@@ -11,11 +12,12 @@ from polar.authz.service import (
 )
 from polar.customer.schemas.customer import CustomerID, ExternalCustomerID
 from polar.exceptions import ResourceNotFound
-from polar.kit.csv import IterableCSVWriter
+from polar.kit.csv import CSVStreamingResponse, IterableCSVWriter
 from polar.kit.metadata import MetadataQuery, get_metadata_query_openapi_schema
 from polar.kit.pagination import ListResource, PaginationParams, PaginationParamsQuery
 from polar.kit.schemas import MultipleQueryFilter
 from polar.models import Order
+from polar.models.order import OrderStatus
 from polar.models.product import ProductBillingType
 from polar.openapi import APITag
 from polar.organization.resolver import get_payload_organization
@@ -43,9 +45,9 @@ from .schemas import (
 )
 from .service import (
     MissingInvoiceBillingDetails,
-    NotPaidOrder,
     OffSessionChargesNotEnabled,
     OrderNotDraft,
+    OrderNotEligibleForInvoice,
     OrganizationNotReadyForPayments,
     PaymentActionRequired,
     PaymentFailed,
@@ -53,6 +55,32 @@ from .service import (
 from .service import order as order_service
 
 router = APIRouter(prefix="/orders", tags=["orders", APITag.public])
+
+GENERATE_INVOICE_MINTLIFY_CONTENT = dedent(
+    """
+    <Warning>
+      Once the invoice is generated, it's permanent and cannot be modified.
+
+      Make sure the billing details (name and address) are correct before generating the invoice. You can update them before generating the invoice by calling the [`PATCH /v1/orders/{id}`](/api-reference/orders/update-order) endpoint.
+    </Warning>
+
+    <Note>
+      After successfully calling this endpoint, you get a `202` response, meaning the generation of the invoice has been scheduled. It usually only takes a few seconds before you can retrieve the invoice using the [`GET /v1/orders/{id}/invoice`](/api-reference/orders/get-order-invoice) endpoint.
+
+      If you want a reliable notification when the invoice is ready, you can listen to the [`order.updated`](/api-reference/orderupdated) webhook and check the [`is_invoice_generated` field](/api-reference/orderupdated#schema-data-is-invoice-generated).
+    </Note>
+    """
+).strip()
+
+GET_INVOICE_MINTLIFY_CONTENT = dedent(
+    """
+    <Note>
+      The invoice must be generated first before it can be retrieved. You should call the [`POST /v1/orders/{id}/invoice`](/api-reference/orders/generate-order-invoice) endpoint to generate the invoice.
+
+      If the invoice is not generated, you will receive a `404` error.
+    </Note>
+    """
+).strip()
 
 
 @router.get(
@@ -99,6 +127,17 @@ async def list(
     subscription_id: MultipleQueryFilter[SubscriptionID] | None = Query(
         None, title="SubscriptionID Filter", description="Filter by subscription ID."
     ),
+    status: MultipleQueryFilter[OrderStatus] | None = Query(
+        None, title="Status Filter", description="Filter by order status."
+    ),
+    created_after: datetime | None = Query(
+        None,
+        description="Only include orders created after this date",
+    ),
+    created_before: datetime | None = Query(
+        None,
+        description="Only include orders created before this date",
+    ),
     session: AsyncReadSession = Depends(get_db_read_session),
 ) -> ListResource[OrderSchema]:
     """List orders."""
@@ -113,6 +152,9 @@ async def list(
         external_customer_id=external_customer_id,
         checkout_id=checkout_id,
         subscription_id=subscription_id,
+        status=status,
+        created_after=created_after,
+        created_before=created_before,
         metadata=metadata,
         pagination=pagination,
         sorting=sorting,
@@ -125,15 +167,7 @@ async def list(
     )
 
 
-@router.get(
-    "/export",
-    summary="Export Orders",
-    responses={
-        200: {
-            "content": {"text/csv": {"schema": {"type": "string"}}},
-        },
-    },
-)
+@router.get("/export", summary="Export Orders", response_class=CSVStreamingResponse)
 async def export(
     auth_subject: auth.OrdersRead,
     organization_id: MultipleQueryFilter[OrganizationID] | None = Query(
@@ -143,7 +177,7 @@ async def export(
         None, title="ProductID Filter", description="Filter by product ID."
     ),
     session: AsyncReadSession = Depends(get_db_read_session),
-) -> Response:
+) -> CSVStreamingResponse:
     """Export orders as a CSV file."""
 
     async def create_csv() -> AsyncGenerator[str, None]:
@@ -182,12 +216,7 @@ async def export(
                 )
             )
 
-    filename = "polar-orders.csv"
-    return StreamingResponse(
-        create_csv(),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
-    )
+    return CSVStreamingResponse(create_csv(), "polar-orders.csv")
 
 
 @router.get(
@@ -305,11 +334,17 @@ async def finalize(
     status_code=202,
     summary="Generate Order Invoice",
     responses={
+        404: OrderNotFound,
+        409: {
+            "description": "Order is not eligible for invoice generation (invalid status).",
+            "model": OrderNotEligibleForInvoice.schema(),
+        },
         422: {
-            "description": "Order is not paid or is missing billing name or address.",
-            "model": MissingInvoiceBillingDetails.schema() | NotPaidOrder.schema(),
+            "description": "Order is missing billing name or address.",
+            "model": MissingInvoiceBillingDetails.schema(),
         },
     },
+    openapi_extra={"x-mint": {"content": GENERATE_INVOICE_MINTLIFY_CONTENT}},
 )
 async def generate_invoice(
     id: OrderID,
@@ -334,6 +369,7 @@ async def generate_invoice(
     summary="Get Order Invoice",
     response_model=OrderInvoice,
     responses={404: OrderNotFound},
+    openapi_extra={"x-mint": {"content": GET_INVOICE_MINTLIFY_CONTENT}},
 )
 async def invoice(
     id: OrderID,

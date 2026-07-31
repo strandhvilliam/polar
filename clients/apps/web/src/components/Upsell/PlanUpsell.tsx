@@ -44,9 +44,11 @@ export const PlanUpsell = ({ organization }: PlanUpsellProps) => {
     organization.id,
     'organization:manage',
   )
-  const gatedOrgId = canManageBilling ? organization.id : undefined
-  const subscriptionQuery = useOrganizationSubscription(gatedOrgId)
-  const plansQuery = useOrganizationPlans(gatedOrgId)
+  const subscriptionQuery = useOrganizationSubscription(
+    organization.id,
+    canManageBilling,
+  )
+  const plansQuery = useOrganizationPlans(organization.id, canManageBilling)
   const startCheckout = useStartSubscriptionCheckout(organization.id)
   const { buildUrls } = useBillingPlanTelemetry({
     source: 'plan_upsell',
@@ -59,13 +61,16 @@ export const PlanUpsell = ({ organization }: PlanUpsellProps) => {
     return { startDate: subDays(now, 30), endDate: now }
   }, [])
 
-  const metricsQuery = useMetrics({
-    organization_id: organization.id,
-    startDate,
-    endDate,
-    interval: 'day',
-    metrics: ['revenue', 'orders', 'monthly_recurring_revenue'],
-  })
+  const metricsQuery = useMetrics(
+    {
+      organization_id: organization.id,
+      startDate,
+      endDate,
+      interval: 'day',
+      metrics: ['revenue', 'orders', 'monthly_recurring_revenue'],
+    },
+    canManageBilling,
+  )
 
   const monthlyRevenue = Math.max(
     metricsQuery.data?.totals.revenue ?? 0,

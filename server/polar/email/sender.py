@@ -174,31 +174,6 @@ class EmailFromReply(TypedDict):
     reply_to_email_addr: str
 
 
-def enqueue_email(
-    to_email_addr: str,
-    subject: str,
-    html_content: str,
-    from_name: str = DEFAULT_FROM_NAME,
-    from_email_addr: str = DEFAULT_FROM_EMAIL_ADDRESS,
-    email_headers: dict[str, str] | None = None,
-    reply_to_name: str | None = DEFAULT_REPLY_TO_NAME,
-    reply_to_email_addr: str | None = DEFAULT_REPLY_TO_EMAIL_ADDRESS,
-    attachments: Iterable[Attachment] | None = None,
-) -> None:
-    enqueue_job(
-        "email.send",
-        to_email_addr=to_email_addr,
-        subject=subject,
-        html_content=html_content,
-        from_name=from_name,
-        from_email_addr=from_email_addr,
-        email_headers=email_headers,
-        reply_to_name=reply_to_name,
-        reply_to_email_addr=reply_to_email_addr,
-        attachments=attachments,
-    )
-
-
 def enqueue_email_template(
     email: "Email",
     *,
@@ -210,6 +185,7 @@ def enqueue_email_template(
     reply_to_name: str | None = DEFAULT_REPLY_TO_NAME,
     reply_to_email_addr: str | None = DEFAULT_REPLY_TO_EMAIL_ADDRESS,
     attachments: Iterable[Attachment] | None = None,
+    deduplication_key: str | None = None,
 ) -> None:
     enqueue_job(
         "email.send",
@@ -224,6 +200,7 @@ def enqueue_email_template(
         reply_to_name=reply_to_name,
         reply_to_email_addr=reply_to_email_addr,
         attachments=attachments,
+        deduplication_key=deduplication_key,
     )
 
 

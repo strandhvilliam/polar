@@ -39,6 +39,7 @@ export interface CheckoutFormContextProps {
   loading: boolean
   loadingLabel: string | undefined
   isUpdatePending: boolean
+  trialUnavailable: boolean
 }
 
 // @ts-expect-error - Allow to throw an error if the context is used without a provider
@@ -53,6 +54,7 @@ export const CheckoutFormProvider = ({
   const [loading, setLoading] = useState(false)
   const [loadingLabel, setLoadingLabel] = useState<string | undefined>()
   const [isUpdatePending, setIsUpdatePending] = useState(false)
+  const [trialUnavailable, setTrialUnavailable] = useState(false)
 
   const form = useForm<schemas['CheckoutUpdatePublic']>({
     defaultValues: {
@@ -85,6 +87,9 @@ export const CheckoutFormProvider = ({
             case 'PolarRequestValidationError':
             case 'RequestValidationError':
               setValidationErrors(error.detail, setError)
+              break
+            case 'DiscountRedemptionLimitReached':
+              setError('discount_code', { message: error.detail })
               break
             case 'AlreadyActiveSubscriptionError':
             case 'NotOpenCheckout':
@@ -124,8 +129,11 @@ export const CheckoutFormProvider = ({
           case 'PaymentNotReady':
             setError('root', { message: error.detail })
             break
+          case 'DiscountRedemptionLimitReached':
+            setError('discount_code', { message: error.detail })
+            break
           case 'TrialAlreadyRedeemed':
-            setError('root', { message: error.detail })
+            setTrialUnavailable(true)
             await update({ allow_trial: false })
             break
           case 'ResourceNotFound':
@@ -136,7 +144,7 @@ export const CheckoutFormProvider = ({
 
       throw error
     },
-    [confirmOuter, setError, update],
+    [confirmOuter, setError, update, setTrialUnavailable],
   )
 
   const confirm = useCallback(
@@ -146,6 +154,7 @@ export const CheckoutFormProvider = ({
       elements: StripeElements | null,
     ): Promise<schemas['CheckoutPublicConfirmed']> => {
       setLoading(true)
+      setTrialUnavailable(false)
 
       if (!checkout.is_payment_form_required) {
         setLoadingLabel(t('checkout.loading.processingOrder'))
@@ -249,7 +258,7 @@ export const CheckoutFormProvider = ({
       setLoading(false)
       return updatedCheckout
     },
-    [checkout, setError, _confirm, t],
+    [checkout, setError, _confirm, t, setTrialUnavailable],
   )
 
   return (
@@ -262,6 +271,7 @@ export const CheckoutFormProvider = ({
         loading,
         loadingLabel,
         isUpdatePending,
+        trialUnavailable,
       }}
     >
       {children}

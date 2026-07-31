@@ -47,12 +47,12 @@ class IdentityVerificationProcessing(UserError):
         super().__init__(message, 403)
 
 
-class IdentityVerificationDoesNotExist(UserError):
+class IdentityVerificationForUnknownUser(UserError):
     def __init__(self, identity_verification_id: str) -> None:
         self.identity_verification_id = identity_verification_id
         message = (
             f"Received identity verification {identity_verification_id} from Stripe, "
-            "but no associated User exists."
+            "but it can't be attributed to any User."
         )
         super().__init__(message)
 
@@ -142,11 +142,13 @@ class UserService:
     async def create_identity_verification(
         self, session: AsyncSession, user: User
     ) -> UserIdentityVerification:
+        repository = UserRepository.from_session(session)
+        user_update = await repository.get_by_id(user.id, for_update=True)
+        assert user_update is not None
+        user = user_update
+
         if user.identity_verified:
             raise IdentityAlreadyVerified(user.id)
-
-        if user.identity_verification_status == IdentityVerificationStatus.pending:
-            raise IdentityVerificationProcessing(user.id)
 
         verification_session: stripe_lib.identity.VerificationSession | None = None
         if user.identity_verification_id is not None:
@@ -154,15 +156,22 @@ class UserService:
                 user.identity_verification_id
             )
 
-        if (
-            verification_session is None
-            or verification_session.status != "requires_input"
-        ):
+        if verification_session is not None:
+            match verification_session.status:
+                case "verified":
+                    raise IdentityAlreadyVerified(user.id)
+                case "processing":
+                    raise IdentityVerificationProcessing(user.id)
+                case "requires_input":
+                    pass
+                case _:
+                    verification_session = None
+
+        if verification_session is None:
             verification_session = await stripe_service.create_verification_session(
                 user
             )
 
-        repository = UserRepository.from_session(session)
         await repository.update(
             user, update_dict={"identity_verification_id": verification_session.id}
         )
@@ -172,21 +181,42 @@ class UserService:
             id=verification_session.id, client_secret=verification_session.client_secret
         )
 
+    async def _get_verification_session_user(
+        self,
+        repository: UserRepository,
+        verification_session: stripe_lib.identity.VerificationSession,
+    ) -> User:
+        user = await repository.get_by_identity_verification_id(
+            verification_session.id, for_update=True
+        )
+        if user is not None:
+            return user
+
+        metadata = verification_session.get("metadata") or {}
+        user_id = metadata.get("user_id")
+        if user_id is not None:
+            user = await repository.get_by_id(UUID(user_id), for_update=True)
+            if user is not None:
+                return user
+
+        raise IdentityVerificationForUnknownUser(verification_session.id)
+
     async def identity_verification_verified(
         self,
         session: AsyncSession,
         verification_session: stripe_lib.identity.VerificationSession,
     ) -> User:
         repository = UserRepository.from_session(session)
-        user = await repository.get_by_identity_verification_id(verification_session.id)
-        if user is None:
-            raise IdentityVerificationDoesNotExist(verification_session.id)
+        user = await self._get_verification_session_user(
+            repository, verification_session
+        )
 
         assert verification_session.status == "verified"
         user = await repository.update(
             user,
             update_dict={
-                "identity_verification_status": IdentityVerificationStatus.verified
+                "identity_verification_status": IdentityVerificationStatus.verified,
+                "identity_verification_id": verification_session.id,
             },
         )
 
@@ -203,12 +233,15 @@ class UserService:
         verification_session: stripe_lib.identity.VerificationSession,
     ) -> User:
         repository = UserRepository.from_session(session)
-        user = await repository.get_by_identity_verification_id(verification_session.id)
-        if user is None:
-            raise IdentityVerificationDoesNotExist(verification_session.id)
+        user = await self._get_verification_session_user(
+            repository, verification_session
+        )
 
-        # If the user is already verified, we don't need to update their status.
-        # Might happen if the webhook was delayed
+        if user.identity_verification_id != verification_session.id:
+            return user
+
+        # Once a user is verified, keep them verified: a late `processing` webhook
+        # must not overwrite it. A failed user can retry, so `failed` -> `pending` is fine.
         if user.identity_verified:
             return user
 
@@ -226,9 +259,17 @@ class UserService:
         verification_session: stripe_lib.identity.VerificationSession,
     ) -> User:
         repository = UserRepository.from_session(session)
-        user = await repository.get_by_identity_verification_id(verification_session.id)
-        if user is None:
-            raise IdentityVerificationDoesNotExist(verification_session.id)
+        user = await self._get_verification_session_user(
+            repository, verification_session
+        )
+
+        if user.identity_verification_id != verification_session.id:
+            return user
+
+        # Once a user is verified, keep them verified. An old or repeated webhook
+        # from a past attempt must not undo it.
+        if user.identity_verified:
+            return user
 
         # TODO: should we send an email?
 

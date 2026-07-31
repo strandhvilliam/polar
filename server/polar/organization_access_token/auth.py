@@ -2,27 +2,34 @@ from typing import Annotated
 
 from fastapi import Depends
 
-from polar.auth.dependencies import Authenticator
-from polar.auth.models import AuthSubject, Organization, User
+from polar.auth.models import AuthSubject, User
 from polar.auth.scope import Scope
+from polar.authz.dependencies import WebUserAuthorizer, WebUserAuthorizerFresh
 
-_OrganizationAccessTokensRead = Authenticator(
+_OrganizationAccessTokensRead = WebUserAuthorizer(
     required_scopes={
         Scope.organization_access_tokens_read,
         Scope.organization_access_tokens_write,
-    },
-    allowed_subjects={User, Organization},
+    }
 )
 OrganizationAccessTokensRead = Annotated[
-    AuthSubject[User | Organization], Depends(_OrganizationAccessTokensRead)
+    AuthSubject[User], Depends(_OrganizationAccessTokensRead)
 ]
 
-_OrganizationAccessTokensWrite = Authenticator(
+_OrganizationAccessTokensWrite = WebUserAuthorizer(
     required_scopes={
         Scope.organization_access_tokens_write,
-    },
-    allowed_subjects={User, Organization},
+    }
 )
 OrganizationAccessTokensWrite = Annotated[
-    AuthSubject[User | Organization], Depends(_OrganizationAccessTokensWrite)
+    AuthSubject[User], Depends(_OrganizationAccessTokensWrite)
+]
+
+_OrganizationAccessTokensWriteFresh = WebUserAuthorizerFresh(
+    required_scopes={
+        Scope.organization_access_tokens_write,
+    }
+)
+OrganizationAccessTokensWriteFresh = Annotated[
+    AuthSubject[User], Depends(_OrganizationAccessTokensWriteFresh)
 ]

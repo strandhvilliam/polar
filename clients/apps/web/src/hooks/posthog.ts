@@ -1,5 +1,6 @@
 'use client'
 
+import { DISTINCT_ID_COOKIE } from '@/experiments/constants'
 import type { schemas } from '@polar-sh/client'
 import type { JsonType } from '@posthog/core'
 import type { CaptureOptions } from 'posthog-js'
@@ -67,7 +68,7 @@ export interface PolarHog {
     options?: CaptureOptions,
   ) => void
   identify: (user: schemas['UserRead']) => void
-  logout: () => void
+  reset: () => void
 }
 
 export const usePostHog = (): PolarHog => {
@@ -103,19 +104,19 @@ export const usePostHog = (): PolarHog => {
     [posthog],
   )
 
-  const logout: PolarHog['logout'] = useCallback(() => {
-    capture('global:user:logout:done')
-    posthog?.reset()
-  }, [capture, posthog])
+  const reset: PolarHog['reset'] = useCallback(() => {
+    posthog.reset()
+    document.cookie = `${DISTINCT_ID_COOKIE}=; max-age=0; path=/; samesite=lax`
+  }, [posthog])
 
   const context = useMemo(
     () => ({
       setPersistence,
       capture,
       identify,
-      logout,
+      reset,
     }),
-    [setPersistence, capture, identify, logout],
+    [setPersistence, capture, identify, reset],
   )
 
   return context

@@ -32,6 +32,7 @@ from polar.models import (
     Customer,
     Event,
     Meter,
+    MeterEvent,
 )
 from polar.models.event import EventSource
 from polar.models.product_price import ProductPriceMeteredUnit
@@ -242,7 +243,11 @@ class EventRepository(RepositoryBase[Event], RepositoryIDMixin[Event, UUID]):
         return result.scalar_one_or_none()
 
     async def get_latest_meter_reset(
-        self, customer: Customer, meter_id: UUID
+        self,
+        customer: Customer,
+        meter_id: UUID,
+        *,
+        cutoff: datetime | None = None,
     ) -> Event | None:
         statement = (
             self.get_base_statement()
@@ -255,6 +260,8 @@ class EventRepository(RepositoryBase[Event], RepositoryIDMixin[Event, UUID]):
             .order_by(Event.timestamp.desc())
             .limit(1)
         )
+        if cutoff is not None:
+            statement = statement.where(Event.timestamp < cutoff)
         return await self.get_one_or_none(statement)
 
     def get_customer_id_filter_clause(
@@ -299,10 +306,89 @@ class EventRepository(RepositoryBase[Event], RepositoryIDMixin[Event, UUID]):
             self.get_meter_clause(meter),
         )
 
+    async def get_meter_billing_page(
+        self,
+        meter_id: UUID,
+        *,
+        after_ingested_at: datetime | None,
+        after_event_id: UUID | None,
+        limit: int,
+    ) -> Sequence[tuple[Event, Customer | None]]:
+        page_statement = (
+            select(
+                MeterEvent.event_id,
+                MeterEvent.customer_id,
+                MeterEvent.external_customer_id,
+                MeterEvent.organization_id,
+                MeterEvent.ingested_at,
+            )
+            .where(MeterEvent.meter_id == meter_id)
+            .order_by(MeterEvent.ingested_at.asc(), MeterEvent.event_id.asc())
+            .limit(limit)
+        )
+        if after_ingested_at is not None:
+            assert after_event_id is not None
+            page_statement = page_statement.where(
+                or_(
+                    MeterEvent.ingested_at > after_ingested_at,
+                    and_(
+                        MeterEvent.ingested_at == after_ingested_at,
+                        MeterEvent.event_id > after_event_id,
+                    ),
+                )
+            )
+
+        event_page = page_statement.cte("meter_billing_event_page")
+        resolved_customers = (
+            select(
+                event_page.c.event_id,
+                event_page.c.ingested_at,
+                event_page.c.customer_id.label("resolved_customer_id"),
+            )
+            .where(event_page.c.customer_id.is_not(None))
+            .union_all(
+                select(
+                    event_page.c.event_id,
+                    event_page.c.ingested_at,
+                    Customer.id.label("resolved_customer_id"),
+                )
+                .join(
+                    Customer,
+                    and_(
+                        Customer.external_id == event_page.c.external_customer_id,
+                        Customer.organization_id == event_page.c.organization_id,
+                    ),
+                )
+                .where(event_page.c.customer_id.is_(None))
+            )
+            .cte("meter_billing_resolved_customers")
+        )
+        statement = (
+            select(Event, Customer)
+            .join(event_page, event_page.c.event_id == Event.id)
+            .outerjoin(
+                resolved_customers,
+                resolved_customers.c.event_id == event_page.c.event_id,
+            )
+            .outerjoin(
+                Customer, Customer.id == resolved_customers.c.resolved_customer_id
+            )
+            .order_by(
+                event_page.c.ingested_at.asc(),
+                event_page.c.event_id.asc(),
+            )
+        )
+        result = await self.session.execute(statement)
+        return [(event, customer) for event, customer in result.all()]
+
     def get_by_pending_entries_statement(
-        self, subscription: UUID, price: UUID
+        self,
+        subscription: UUID,
+        price: UUID,
+        *,
+        cutoff: datetime | None = None,
     ) -> Select[tuple[Event]]:
-        return (
+        statement = (
             self.get_base_statement()
             .join(BillingEntry, Event.id == BillingEntry.event_id)
             .where(
@@ -312,16 +398,23 @@ class EventRepository(RepositoryBase[Event], RepositoryIDMixin[Event, UUID]):
             )
             .order_by(Event.ingested_at.asc())
         )
+        if cutoff is not None:
+            statement = statement.where(BillingEntry.start_timestamp < cutoff)
+        return statement
 
     def get_by_pending_entries_for_meter_statement(
-        self, subscription: UUID, meter: UUID
+        self,
+        subscription: UUID,
+        meter: UUID,
+        *,
+        cutoff: datetime | None = None,
     ) -> Select[tuple[Event]]:
         """
         Get events for pending billing entries grouped by meter.
         Used for non-summable aggregations where we need to compute across all events
         in the period, regardless of which price was active when the event occurred.
         """
-        return (
+        statement = (
             self.get_base_statement()
             .join(BillingEntry, Event.id == BillingEntry.event_id)
             .join(
@@ -335,6 +428,9 @@ class EventRepository(RepositoryBase[Event], RepositoryIDMixin[Event, UUID]):
             )
             .order_by(Event.ingested_at.asc())
         )
+        if cutoff is not None:
+            statement = statement.where(BillingEntry.start_timestamp < cutoff)
+        return statement
 
     def get_eager_options(self) -> Options:
         return (joinedload(Event.customer), joinedload(Event.event_types))

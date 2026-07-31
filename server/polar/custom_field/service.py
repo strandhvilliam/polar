@@ -17,7 +17,7 @@ from sqlalchemy.orm import contains_eager
 
 from polar.auth.models import AuthSubject, is_organization, is_user
 from polar.auth.permission import OrganizationPermission
-from polar.authz.repository import select_user_org_ids
+from polar.authz.repository import select_accessible_org_ids
 from polar.authz.service import (
     assert_organization_permission,
     assert_resource_permission,
@@ -34,6 +34,7 @@ from polar.postgres import AsyncReadSession, AsyncSession
 
 from .attachment import attached_custom_fields_models
 from .data import custom_field_data_models
+from .repository import CustomFieldRepository
 from .schemas import CustomFieldCreate, CustomFieldUpdate
 
 
@@ -73,17 +74,13 @@ class CustomFieldService(ResourceServiceReader[CustomField]):
         for criterion, is_desc in sorting:
             clause_function = desc if is_desc else asc
             if criterion == CustomFieldSortProperty.created_at:
-                order_by_clauses.append(
-                    clause_function(CustomFieldSortProperty.created_at)
-                )
+                order_by_clauses.append(clause_function(CustomField.created_at))
             elif criterion == CustomFieldSortProperty.slug:
-                order_by_clauses.append(clause_function(CustomFieldSortProperty.slug))
+                order_by_clauses.append(clause_function(CustomField.slug))
             elif criterion == CustomFieldSortProperty.custom_field_name:
-                order_by_clauses.append(
-                    clause_function(CustomFieldSortProperty.custom_field_name)
-                )
+                order_by_clauses.append(clause_function(CustomField.name))
             elif criterion == CustomFieldSortProperty.type:
-                order_by_clauses.append(clause_function(CustomFieldSortProperty.type))
+                order_by_clauses.append(clause_function(CustomField.type))
         statement = statement.order_by(*order_by_clauses)
 
         return await paginate(session, statement, pagination=pagination)
@@ -116,8 +113,9 @@ class CustomFieldService(ResourceServiceReader[CustomField]):
             OrganizationPermission.custom_fields_manage,
         )
 
-        existing_field = await self._get_by_organization_id_and_slug(
-            session, organization.id, custom_field_create.slug
+        repository = CustomFieldRepository.from_session(session)
+        existing_field = await repository.get_by_organization_and_slug(
+            organization.id, custom_field_create.slug
         )
         if existing_field is not None:
             raise PolarRequestValidationError(
@@ -171,8 +169,9 @@ class CustomFieldService(ResourceServiceReader[CustomField]):
             custom_field_update.slug is not None
             and custom_field.slug != custom_field_update.slug
         ):
-            existing_field = await self._get_by_organization_id_and_slug(
-                session, custom_field.organization_id, custom_field_update.slug
+            repository = CustomFieldRepository.from_session(session)
+            existing_field = await repository.get_by_organization_and_slug(
+                custom_field.organization_id, custom_field_update.slug
             )
             if existing_field is not None and existing_field.id != custom_field.id:
                 raise PolarRequestValidationError(
@@ -252,16 +251,6 @@ class CustomFieldService(ResourceServiceReader[CustomField]):
         result = await session.execute(statement)
         return result.scalar_one_or_none()
 
-    async def _get_by_organization_id_and_slug(
-        self, session: AsyncSession, organization_id: uuid.UUID, slug: str
-    ) -> CustomField | None:
-        statement = select(CustomField).where(
-            CustomField.organization_id == organization_id,
-            CustomField.slug == slug,
-        )
-        result = await session.execute(statement)
-        return result.scalar_one_or_none()
-
     def _get_readable_custom_field_statement(
         self, auth_subject: AuthSubject[User | Organization]
     ) -> Select[tuple[CustomField]]:
@@ -275,8 +264,8 @@ class CustomFieldService(ResourceServiceReader[CustomField]):
         if is_user(auth_subject):
             statement = statement.where(
                 CustomField.organization_id.in_(
-                    select_user_org_ids(
-                        auth_subject.subject.id,
+                    select_accessible_org_ids(
+                        auth_subject,
                         permission=OrganizationPermission.custom_fields_read,
                     )
                 )

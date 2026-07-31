@@ -1,7 +1,7 @@
 import contextlib
 import uuid
 from collections.abc import AsyncIterator, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from sqlalchemy import Select, UnaryExpression, asc, delete, desc, func, or_, select
@@ -9,19 +9,24 @@ from sqlalchemy.exc import DBAPIError
 
 from polar.auth.models import AuthSubject, is_organization, is_user
 from polar.auth.permission import OrganizationPermission
-from polar.authz.repository import select_user_org_ids
+from polar.authz.repository import select_accessible_org_ids
 from polar.authz.service import (
     assert_organization_permission,
     assert_resource_permission,
 )
-from polar.discount.repository import DiscountRepository
+from polar.discount.repository import (
+    DiscountRedemptionRepository,
+    DiscountRepository,
+)
 from polar.exceptions import PolarError, PolarRequestValidationError
 from polar.kit.db.locking import is_lock_not_available_error
+from polar.kit.email import unalias_email
 from polar.kit.pagination import PaginationParams, paginate
 from polar.kit.services import ResourceServiceReader
 from polar.kit.sorting import Sorting
 from polar.kit.utils import utc_now
 from polar.models import (
+    Customer,
     Discount,
     DiscountProduct,
     Organization,
@@ -31,9 +36,11 @@ from polar.models import (
 from polar.models.checkout import Checkout
 from polar.models.discount import DiscountFixed
 from polar.models.discount_redemption import DiscountRedemption
+from polar.models.webhook_endpoint import WebhookEventType
 from polar.organization.resolver import get_payload_organization
 from polar.postgres import AsyncSession
 from polar.product.repository import ProductRepository
+from polar.webhook.service import webhook as webhook_service
 
 from .schemas import DiscountCreate, DiscountFixedCreate, DiscountUpdate
 from .sorting import DiscountSortProperty
@@ -183,7 +190,11 @@ class DiscountService(ResourceServiceReader[Discount]):
             discount_redemptions=[],
             redemptions_count=0,
         )
-        return await repository.create(discount)
+        discount = await repository.create(discount, flush=True)
+
+        await self._send_webhook(session, discount, WebhookEventType.discount_created)
+
+        return discount
 
     async def update(
         self,
@@ -246,24 +257,22 @@ class DiscountService(ResourceServiceReader[Discount]):
                 else {"basis_points"}
             )
             for field in forbidden_fields:
-                discount_update_value = getattr(discount_update, field, None)
-                if (
-                    discount_update_value is not None
-                    and discount_update_value != getattr(discount, field, None)
-                ):
-                    raise PolarRequestValidationError(
-                        [
-                            {
-                                "type": "value_error",
-                                "loc": ("body", field),
-                                "msg": (
-                                    "This field cannot be changed because "
-                                    "the discount has already been redeemed."
-                                ),
-                                "input": getattr(discount, field),
-                            }
-                        ]
-                    )
+                if field in discount_update.model_fields_set:
+                    discount_update_value = getattr(discount_update, field)
+                    if discount_update_value != getattr(discount, field, None):
+                        raise PolarRequestValidationError(
+                            [
+                                {
+                                    "type": "value_error",
+                                    "loc": ("body", field),
+                                    "msg": (
+                                        "This field cannot be changed because "
+                                        "the discount has already been redeemed."
+                                    ),
+                                    "input": getattr(discount, field),
+                                }
+                            ]
+                        )
 
         if discount_update.products is not None:
             nested = await session.begin_nested()
@@ -310,6 +319,8 @@ class DiscountService(ResourceServiceReader[Discount]):
         await session.flush()
         await session.refresh(discount)
 
+        await self._send_webhook(session, discount, WebhookEventType.discount_updated)
+
         return discount
 
     async def delete(
@@ -323,6 +334,9 @@ class DiscountService(ResourceServiceReader[Discount]):
         )
         discount.set_deleted_at()
         session.add(discount)
+
+        await self._send_webhook(session, discount, WebhookEventType.discount_deleted)
+
         return discount
 
     async def get_by_id_and_organization(
@@ -426,25 +440,66 @@ class DiscountService(ResourceServiceReader[Discount]):
 
         return True
 
+    async def check_per_customer_limit_reached(
+        self,
+        session: AsyncSession,
+        discount: Discount,
+        *,
+        checkout: Checkout,
+        customer: Customer | None = None,
+        payment_method_fingerprint: str | None = None,
+    ) -> bool:
+        """
+        Check whether a customer has reached the discount's per-customer redemption limit.
+
+        The customer is identified using the same signals as the trial-abuse feature:
+        customer ID, unaliased email, and payment method fingerprint (OR logic), scoped
+        to this specific discount. Returns ``False`` when no per-customer limit is set.
+
+        Before confirmation there is no customer yet, so the checkout's own fields are
+        used instead.
+        """
+        if discount.max_redemptions_per_customer is None:
+            return False
+
+        customer_id = customer.id if customer is not None else checkout.customer_id
+        email = (
+            customer.email
+            if customer is not None and customer.email
+            else checkout.customer_email
+        )
+
+        repository = DiscountRedemptionRepository.from_session(session)
+        count = await repository.count_redemptions_by_customer(
+            discount.id,
+            exclude_checkout_id=checkout.id,
+            customer_id=customer_id,
+            customer_email=unalias_email(email).lower() if email else None,
+            payment_method_fingerprint=payment_method_fingerprint,
+        )
+        return count >= discount.max_redemptions_per_customer
+
     @contextlib.asynccontextmanager
     async def redeem_discount(
         self, session: AsyncSession, discount: Discount
     ) -> AsyncIterator[DiscountRedemption]:
         """
-        Redeem a discount with FOR UPDATE lock to prevent concurrent redemptions.
+        Redeem a discount, locking its row when globally capped so the count can't be
+        read stale. Without that cap the lock would make concurrent buyers of the same
+        code fail each other.
 
-        Uses PostgreSQL row-level locking instead of Redis distributed locks.
-        The lock is held until the parent transaction commits.
+        A per-customer cap serializes on the customer row instead, which the caller
+        must lock before it checks the count.
         """
         repository = DiscountRepository.from_session(session)
 
-        # Acquire FOR UPDATE lock (we're already inside checkout's transaction)
-        try:
-            await repository.get_by_id_for_update(discount.id, nowait=True)
-        except DBAPIError as e:
-            if is_lock_not_available_error(e):
-                raise DiscountNotRedeemableError(discount) from e
-            raise
+        if discount.max_redemptions is not None:
+            try:
+                await repository.get_by_id(discount.id, for_update=True, nowait=True)
+            except DBAPIError as e:
+                if is_lock_not_available_error(e):
+                    raise DiscountNotRedeemableError(discount) from e
+                raise
 
         if not await self.is_redeemable_discount(session, discount):
             raise DiscountNotRedeemableError(discount)
@@ -465,6 +520,18 @@ class DiscountService(ResourceServiceReader[Discount]):
         )
         await session.execute(statement)
 
+    async def _send_webhook(
+        self,
+        session: AsyncSession,
+        discount: Discount,
+        event_type: Literal[
+            WebhookEventType.discount_created,
+            WebhookEventType.discount_updated,
+            WebhookEventType.discount_deleted,
+        ],
+    ) -> None:
+        await webhook_service.send(session, discount.organization, event_type, discount)
+
     def _get_readable_discount_statement(
         self, auth_subject: AuthSubject[User | Organization]
     ) -> Select[tuple[Discount]]:
@@ -473,9 +540,8 @@ class DiscountService(ResourceServiceReader[Discount]):
         if is_user(auth_subject):
             statement = statement.where(
                 Discount.organization_id.in_(
-                    select_user_org_ids(
-                        auth_subject.subject.id,
-                        permission=OrganizationPermission.products_read,
+                    select_accessible_org_ids(
+                        auth_subject, permission=OrganizationPermission.products_read
                     )
                 )
             )

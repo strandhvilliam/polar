@@ -12,21 +12,21 @@ description: "Our webhook events and in which context they are useful"
   <Card
     title="checkout.created"
     icon="link"
-    href="/api-reference/webhooks/checkout.created"
+    href="/api-reference/checkoutcreated"
     horizontal
   ></Card>
 
   <Card
     title="checkout.updated"
     icon="link"
-    href="/api-reference/webhooks/checkout.updated"
+    href="/api-reference/checkoutupdated"
     horizontal
   ></Card>
 
   <Card
     title="checkout.expired"
     icon="link"
-    href="/api-reference/webhooks/checkout.expired"
+    href="/api-reference/checkoutexpired"
     horizontal
   >
     Fired when a checkout link has expired without being completed.
@@ -39,7 +39,7 @@ description: "Our webhook events and in which context they are useful"
   <Card
     title="customer.created"
     icon="link"
-    href="/api-reference/webhooks/customer.created"
+    href="/api-reference/customercreated"
     horizontal
   >
     Fired when a new customer has been created.
@@ -48,7 +48,7 @@ description: "Our webhook events and in which context they are useful"
   <Card
     title="customer.updated"
     icon="link"
-    href="/api-reference/webhooks/customer.updated"
+    href="/api-reference/customerupdated"
     horizontal
   >
     Fired when a customer has been updated.
@@ -57,7 +57,7 @@ description: "Our webhook events and in which context they are useful"
   <Card
     title="customer.deleted"
     icon="link"
-    href="/api-reference/webhooks/customer.deleted"
+    href="/api-reference/customerdeleted"
     horizontal
   >
     Fired when a customer has been deleted.
@@ -66,7 +66,7 @@ description: "Our webhook events and in which context they are useful"
   <Card
     title="customer.state_changed"
     icon="link"
-    href="/api-reference/webhooks/customer.state_changed"
+    href="/api-reference/customerstate_changed"
     horizontal
   >
     Fired when a customer's state has changed. Includes active subscriptions and
@@ -82,7 +82,7 @@ In order to properly implement logic for handling subscriptions, you should look
   <Card
     title="subscription.created"
     icon="link"
-    href="/api-reference/webhooks/subscription.created"
+    href="/api-reference/subscriptioncreated"
     horizontal
   >
     Fired when a new subscription has been created.
@@ -91,28 +91,37 @@ In order to properly implement logic for handling subscriptions, you should look
   <Card
     title="subscription.active"
     icon="link"
-    href="/api-reference/webhooks/subscription.active"
+    href="/api-reference/subscriptionactive"
     horizontal
   ></Card>
 
   <Card
     title="subscription.uncanceled"
     icon="link"
-    href="/api-reference/webhooks/subscription.uncanceled"
+    href="/api-reference/subscriptionuncanceled"
     horizontal
   ></Card>
 
   <Card
+    title="subscription.cycled"
+    icon="link"
+    href="/api-reference/subscriptioncycled"
+    horizontal
+  >
+    Fired when a subscription enters a new billing period, before the renewal order exists and whether or not the payment succeeds.
+  </Card>
+
+  <Card
     title="subscription.canceled"
     icon="link"
-    href="/api-reference/webhooks/subscription.canceled"
+    href="/api-reference/subscriptioncanceled"
     horizontal
   ></Card>
 
   <Card
     title="subscription.past_due"
     icon="link"
-    href="/api-reference/webhooks/subscription.past_due"
+    href="/api-reference/subscriptionpast_due"
     horizontal
   >
     Fired when a subscription payment has failed. The customer can recover by updating their payment method.
@@ -121,32 +130,52 @@ In order to properly implement logic for handling subscriptions, you should look
   <Card
     title="subscription.updated"
     icon="link"
-    href="/api-reference/webhooks/subscription.updated"
+    href="/api-reference/subscriptionupdated"
     horizontal
   >
     Use this event if you want to handle cancellations, un-cancellations, etc. The
     updated event is a catch-all event for `subscription.active`,
-    `subscription.canceled`, `subscription.uncanceled`, `subscription.past_due` and `subscription.revoked`.
+    `subscription.canceled`, `subscription.uncanceled`, `subscription.cycled`,
+    `subscription.past_due`, `subscription.revoked`, `subscription.paused` and
+    `subscription.resumed`.
   </Card>
 
   <Card
     title="order.created"
     icon="link"
-    href="/api-reference/webhooks/order.created"
+    href="/api-reference/ordercreated"
     horizontal
   >
-    In case you want to do logic when a subscription is renewed, you should listen
-    to `order.created` and the `billing_reason` field. It can be `purchase`,
-    `subscription_create`, `subscription_cycle` and `subscription_update`.
-    `subscription_cycle` is used when subscriptions renew.
+    Carries a `billing_reason` field, which can be `purchase`,
+    `subscription_create`, `subscription_cycle` and `subscription_update`. To act
+    on a renewal, listen to `subscription.cycled` instead: it fires whether or not
+    the renewal payment succeeds.
   </Card>
 
   <Card
     title="subscription.revoked"
     icon="link"
-    href="/api-reference/webhooks/subscription.revoked"
+    href="/api-reference/subscriptionrevoked"
     horizontal
   ></Card>
+
+  <Card
+    title="subscription.paused"
+    icon="link"
+    href="/api-reference/subscriptionpaused"
+    horizontal
+  >
+    Fired when a scheduled pause takes effect at the end of the period. Billing stops and benefits are revoked until the subscription resumes.
+  </Card>
+
+  <Card
+    title="subscription.resumed"
+    icon="link"
+    href="/api-reference/subscriptionresumed"
+    horizontal
+  >
+    Fired when a paused subscription resumes. A new billing period starts and the customer is charged immediately.
+  </Card>
 </Columns>
 
 #### Cancellation Sequences
@@ -187,8 +216,11 @@ When a subscription is renewed for a new cycle, the webhook events are triggered
 
 When a subscription reaches its renewal date, the following events are sent immediately (if enabled on the webhook):
 
-1. `subscription.updated`
-2. `order.created`
+1. `subscription.cycled`
+2. `subscription.updated`
+3. `order.created`
+
+`subscription.cycled` fires only on a new billing period, so you can act on a renewal without inspecting `billing_reason` on the order. It also fires when a trial converts to a paid subscription, since that starts a period too: read `status` to tell the two apart.
 
 The subscription data will reflect the new billing period through the `current_period_start` and `current_period_end` properties, showing the updated cycle dates.
 
@@ -198,10 +230,37 @@ The order data represents the new invoice for the upcoming cycle, with a total r
 
 Shortly after the initial renewal events, the platform will trigger a payment for the new order. Once the payment is successfully processed, the following events are sent:
 
-3. `order.updated`
-4. `order.paid`
+4. `order.updated`
+5. `order.paid`
 
 Both events will contain the same order data, with the order status changed to `paid`.
+
+#### Pause Sequences
+
+Pausing is scheduled for the end of the current billing period, much like an end-of-period cancellation.
+
+When a subscription is **paused** (by customer action from the portal or by the merchant from the dashboard/API), only one event is sent immediately, because the subscription stays `active` until the period ends:
+
+1. `subscription.updated`
+
+The `pause_at_period_end` flag is set to `true`, and `resumes_at` holds the scheduled resume date if you set one.
+
+When the end of the current billing period arrives, the pause takes effect: billing stops and benefits are revoked. The following events are then sent:
+
+2. `subscription.updated`
+3. `subscription.paused`
+
+Both events contain the same subscription data, now with the `paused` status.
+
+**Resume**
+
+When a paused subscription resumes, either immediately when you resume it or automatically on its `resumes_at` date, a new billing period starts and the customer is charged right away. The following events are sent:
+
+1. `subscription.updated`
+2. `subscription.resumed`
+3. `order.created`
+
+The subscription data reflects the new period through `current_period_start` and `current_period_end`, and the order represents the immediate charge for the new cycle.
 
 ### Orders
 
@@ -209,25 +268,25 @@ Both events will contain the same order data, with the order status changed to `
   <Card
     title="order.created"
     icon="link"
-    href="/api-reference/webhooks/order.created"
+    href="/api-reference/ordercreated"
     horizontal
   ></Card>
   <Card
     title="order.paid"
     icon="link"
-    href="/api-reference/webhooks/order.paid"
+    href="/api-reference/orderpaid"
     horizontal
   ></Card>
   <Card
     title="order.updated"
     icon="link"
-    href="/api-reference/webhooks/order.updated"
+    href="/api-reference/orderupdated"
     horizontal
   ></Card>
   <Card
     title="order.refunded"
     icon="link"
-    href="/api-reference/webhooks/order.refunded"
+    href="/api-reference/orderrefunded"
     horizontal
   ></Card>
 </Columns>
@@ -238,13 +297,13 @@ Both events will contain the same order data, with the order status changed to `
   <Card
     title="refund.created"
     icon="link"
-    href="/api-reference/webhooks/refund.created"
+    href="/api-reference/refundcreated"
     horizontal
   ></Card>
   <Card
     title="refund.updated"
     icon="link"
-    href="/api-reference/webhooks/refund.updated"
+    href="/api-reference/refundupdated"
     horizontal
   ></Card>
 </Columns>
@@ -255,19 +314,19 @@ Both events will contain the same order data, with the order status changed to `
   <Card
     title="benefit_grant.created"
     icon="link"
-    href="/api-reference/webhooks/benefit_grant.created"
+    href="/api-reference/benefit_grantcreated"
     horizontal
   ></Card>
   <Card
     title="benefit_grant.updated"
     icon="link"
-    href="/api-reference/webhooks/benefit_grant.updated"
+    href="/api-reference/benefit_grantupdated"
     horizontal
   ></Card>
   <Card
     title="benefit_grant.revoked"
     icon="link"
-    href="/api-reference/webhooks/benefit_grant.revoked"
+    href="/api-reference/benefit_grantrevoked"
     horizontal
   ></Card>
 </Columns>
@@ -280,13 +339,13 @@ Both events will contain the same order data, with the order status changed to `
   <Card
     title="benefit.created"
     icon="link"
-    href="/api-reference/webhooks/benefit.created"
+    href="/api-reference/benefitcreated"
     horizontal
   ></Card>
   <Card
     title="benefit.updated"
     icon="link"
-    href="/api-reference/webhooks/benefit.updated"
+    href="/api-reference/benefitupdated"
     horizontal
   ></Card>
 </Columns>
@@ -297,13 +356,38 @@ Both events will contain the same order data, with the order status changed to `
   <Card
     title="product.created"
     icon="link"
-    href="/api-reference/webhooks/product.created"
+    href="/api-reference/productcreated"
     horizontal
   ></Card>
   <Card
     title="product.updated"
     icon="link"
-    href="/api-reference/webhooks/product.updated"
+    href="/api-reference/productupdated"
+    horizontal
+  ></Card>
+</Columns>
+
+### Discounts
+
+<Columns cols={2}>
+  <Card
+    title="discount.created"
+    icon="link"
+    href="/api-reference/discountcreated"
+    horizontal
+  ></Card>
+
+  <Card
+    title="discount.updated"
+    icon="link"
+    href="/api-reference/discountupdated"
+    horizontal
+  ></Card>
+
+  <Card
+    title="discount.deleted"
+    icon="link"
+    href="/api-reference/discountdeleted"
     horizontal
   ></Card>
 </Columns>
@@ -314,7 +398,7 @@ Both events will contain the same order data, with the order status changed to `
   <Card
     title="organization.updated"
     icon="link"
-    href="/api-reference/webhooks/organization.updated"
+    href="/api-reference/organizationupdated"
     horizontal
   ></Card>
 </Columns>

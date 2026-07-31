@@ -22,6 +22,7 @@ from polar.kit.schemas import (
     ClassName,
     EmptyStrToNone,
     IDSchema,
+    Int32,
     MergeJSONSchema,
     Schema,
     SetSchemaReference,
@@ -90,14 +91,24 @@ EndsAt = Annotated[
     ),
 ]
 MaxRedemptions = Annotated[
-    int | None,
+    Int32 | None,
     Field(
         description="Optional maximum number of times the discount can be redeemed.",
     ),
     Ge(1),
 ]
+MaxRedemptionsPerCustomer = Annotated[
+    Int32 | None,
+    Field(
+        description=(
+            "Optional maximum number of times the discount can be redeemed "
+            "by a single customer."
+        ),
+    ),
+    Ge(1),
+]
 DurationInMonths = Annotated[
-    int,
+    Int32,
     Field(
         description=inspect.cleandoc("""
         Number of months the discount should be applied.
@@ -131,7 +142,7 @@ Amounts = Annotated[
     ),
 ]
 BasisPoints = Annotated[
-    int,
+    Int32,
     Field(
         description=(
             inspect.cleandoc("""
@@ -158,6 +169,7 @@ class DiscountCreateBase(MetadataInputMixin, Schema):
     starts_at: StartsAt = None
     ends_at: EndsAt = None
     max_redemptions: MaxRedemptions = None
+    max_redemptions_per_customer: MaxRedemptionsPerCustomer = None
 
     products: ProductsList | None = None
 
@@ -186,7 +198,7 @@ Duration = Annotated[
     ),
 ]
 DurationInMonthsOptional = Annotated[
-    int | None,
+    Int32 | None,
     Field(
         default=None,
         description=inspect.cleandoc("""
@@ -271,6 +283,7 @@ class DiscountUpdate(MetadataInputMixin, Schema):
     starts_at: StartsAt = None
     ends_at: EndsAt = None
     max_redemptions: MaxRedemptions = None
+    max_redemptions_per_customer: MaxRedemptionsPerCustomer = None
 
     duration: DiscountDuration | None = None
     duration_in_months: DurationInMonths | None = None
@@ -328,6 +341,11 @@ class DiscountBase(MetadataOutputMixin, IDSchema, TimestampedSchema):
     )
     max_redemptions: int | None = Field(
         description="Maximum number of times the discount can be redeemed."
+    )
+    max_redemptions_per_customer: int | None = Field(
+        description=(
+            "Maximum number of times the discount can be redeemed by a single customer."
+        )
     )
 
     redemptions_count: int = Field(

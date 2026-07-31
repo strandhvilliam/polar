@@ -21,6 +21,7 @@ from polar.notifications.notification import (
 )
 from polar.order.schemas import OrderBase, OrderItemSchema
 from polar.organization.schemas import Organization
+from polar.payment_method.schemas import PaymentMethodCard
 from polar.product.schemas import BenefitList, ProductBase
 from polar.subscription.schemas import SubscriptionBase
 
@@ -36,8 +37,9 @@ class EmailTemplate(StrEnum):
     order_confirmation = "order_confirmation"
     organization_access_token_leaked = "organization_access_token_leaked"
     organization_invite = "organization_invite"
-    organization_account_unlink = "organization_account_unlink"
+    organization_offboarded = "organization_offboarded"
     support_case_organization_new_message = "support_case_organization_new_message"
+    payment_method_expiration_reminder = "payment_method_expiration_reminder"
     personal_access_token_leaked = "personal_access_token_leaked"
     seat_invitation = "seat_invitation"
     subscription_cancellation = "subscription_cancellation"
@@ -46,6 +48,8 @@ class EmailTemplate(StrEnum):
     subscription_cycled_after_trial = "subscription_cycled_after_trial"
     subscription_final_invoice = "subscription_final_invoice"
     subscription_past_due = "subscription_past_due"
+    subscription_paused = "subscription_paused"
+    subscription_resumed = "subscription_resumed"
     subscription_revoked = "subscription_revoked"
     subscription_uncanceled = "subscription_uncanceled"
     subscription_renewal_reminder = "subscription_renewal_reminder"
@@ -56,8 +60,11 @@ class EmailTemplate(StrEnum):
     notification_new_subscription = "notification_new_subscription"
     notification_credits_granted = "notification_credits_granted"
     chargeback_prevention_refund = "chargeback_prevention_refund"
+    polar_self_subscription_cancellation = "polar_self_subscription_cancellation"
     polar_self_subscription_confirmation = "polar_self_subscription_confirmation"
     polar_self_subscription_cycled = "polar_self_subscription_cycled"
+    polar_self_subscription_past_due = "polar_self_subscription_past_due"
+    polar_self_subscription_revoked = "polar_self_subscription_revoked"
     polar_self_startup_program_welcome = "polar_self_startup_program_welcome"
 
 
@@ -255,6 +262,21 @@ class SeatInvitationEmail(BaseModel):
     props: SeatInvitationProps
 
 
+class PaymentMethodExpirationReminderProps(EmailProps):
+    organization: Organization
+    payment_method: PaymentMethodCard
+    product_names: list[str]
+    expiration_date: str
+    url: str
+
+
+class PaymentMethodExpirationReminderEmail(BaseModel):
+    template: Literal[EmailTemplate.payment_method_expiration_reminder] = (
+        EmailTemplate.payment_method_expiration_reminder
+    )
+    props: PaymentMethodExpirationReminderProps
+
+
 class SubscriptionPropsBase(EmailProps):
     organization: Organization
     product: ProductEmail
@@ -317,7 +339,8 @@ class SubscriptionFinalInvoiceEmail(BaseModel):
 
 
 class SubscriptionPastDueProps(SubscriptionPropsBase):
-    payment_url: str | None = None
+    access_ends_at: str | None = None
+    deadline: str | None = None
 
 
 class SubscriptionPastDueEmail(BaseModel):
@@ -367,6 +390,26 @@ class SubscriptionUncanceledEmail(BaseModel):
         EmailTemplate.subscription_uncanceled
     )
     props: SubscriptionUncanceledProps
+
+
+class SubscriptionPausedProps(SubscriptionPropsBase): ...
+
+
+class SubscriptionPausedEmail(BaseModel):
+    template: Literal[EmailTemplate.subscription_paused] = (
+        EmailTemplate.subscription_paused
+    )
+    props: SubscriptionPausedProps
+
+
+class SubscriptionResumedProps(SubscriptionPropsBase): ...
+
+
+class SubscriptionResumedEmail(BaseModel):
+    template: Literal[EmailTemplate.subscription_resumed] = (
+        EmailTemplate.subscription_resumed
+    )
+    props: SubscriptionResumedProps
 
 
 class SubscriptionUpdatedProps(SubscriptionPropsBase):
@@ -456,6 +499,40 @@ class PolarSelfSubscriptionCycledEmail(BaseModel):
     props: PolarSelfSubscriptionCycledProps
 
 
+class PolarSelfSubscriptionCancellationProps(EmailProps):
+    product_name: str
+    ends_at: str | None = None
+
+
+class PolarSelfSubscriptionCancellationEmail(BaseModel):
+    template: Literal[EmailTemplate.polar_self_subscription_cancellation] = (
+        EmailTemplate.polar_self_subscription_cancellation
+    )
+    props: PolarSelfSubscriptionCancellationProps
+
+
+class PolarSelfSubscriptionPastDueProps(EmailProps):
+    product_name: str
+
+
+class PolarSelfSubscriptionPastDueEmail(BaseModel):
+    template: Literal[EmailTemplate.polar_self_subscription_past_due] = (
+        EmailTemplate.polar_self_subscription_past_due
+    )
+    props: PolarSelfSubscriptionPastDueProps
+
+
+class PolarSelfSubscriptionRevokedProps(EmailProps):
+    product_name: str
+
+
+class PolarSelfSubscriptionRevokedEmail(BaseModel):
+    template: Literal[EmailTemplate.polar_self_subscription_revoked] = (
+        EmailTemplate.polar_self_subscription_revoked
+    )
+    props: PolarSelfSubscriptionRevokedProps
+
+
 class PolarSelfStartupProgramWelcomeProps(EmailProps):
     organization_name: str
     billing_url: str
@@ -468,16 +545,16 @@ class PolarSelfStartupProgramWelcomeEmail(BaseModel):
     props: PolarSelfStartupProgramWelcomeProps
 
 
-class OrganizationAccountUnlinkProps(EmailProps):
-    organization_kept_name: str
-    organizations_unlinked: list[str]
+class OrganizationOffboardedProps(EmailProps):
+    organization_name: str
+    account_url: str
 
 
-class OrganizationAccountUnlinkEmail(BaseModel):
-    template: Literal[EmailTemplate.organization_account_unlink] = (
-        EmailTemplate.organization_account_unlink
+class OrganizationOffboardedEmail(BaseModel):
+    template: Literal[EmailTemplate.organization_offboarded] = (
+        EmailTemplate.organization_offboarded
     )
-    props: OrganizationAccountUnlinkProps
+    props: OrganizationOffboardedProps
 
 
 Email = Annotated[
@@ -491,8 +568,9 @@ Email = Annotated[
     | OrderConfirmationEmail
     | OrganizationAccessTokenLeakedEmail
     | OrganizationInviteEmail
-    | OrganizationAccountUnlinkEmail
+    | OrganizationOffboardedEmail
     | SupportCaseOrganizationNewMessageEmail
+    | PaymentMethodExpirationReminderEmail
     | PersonalAccessTokenLeakedEmail
     | SeatInvitationEmail
     | SubscriptionCancellationEmail
@@ -501,6 +579,8 @@ Email = Annotated[
     | SubscriptionCycledAfterTrialEmail
     | SubscriptionFinalInvoiceEmail
     | SubscriptionPastDueEmail
+    | SubscriptionPausedEmail
+    | SubscriptionResumedEmail
     | SubscriptionRenewalReminderEmail
     | SubscriptionTrialConversionReminderEmail
     | SubscriptionRevokedEmail
@@ -511,8 +591,11 @@ Email = Annotated[
     | NotificationNewSubscriptionEmail
     | NotificationCreditsGrantedEmail
     | ChargebackPreventionRefundEmail
+    | PolarSelfSubscriptionCancellationEmail
     | PolarSelfSubscriptionConfirmationEmail
     | PolarSelfSubscriptionCycledEmail
+    | PolarSelfSubscriptionPastDueEmail
+    | PolarSelfSubscriptionRevokedEmail
     | PolarSelfStartupProgramWelcomeEmail,
     Discriminator("template"),
 ]

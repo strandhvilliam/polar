@@ -1033,6 +1033,8 @@ export interface components {
       update_seats: boolean
       /** Update Plan */
       update_plan: boolean
+      /** Pause */
+      pause?: boolean
     }
     /** CustomerPortalUsageSettings */
     CustomerPortalUsageSettings: {
@@ -1476,6 +1478,12 @@ export interface components {
       subscription_id: string | null
       /** Checkout Id */
       checkout_id: string | null
+      /**
+       * Next Payment Attempt At
+       * @description When the next automatic payment retry is scheduled. `null` if the order is not in dunning or all retries have been exhausted.
+       * @default null
+       */
+      next_payment_attempt_at: string | null
       /** Description */
       description: string
       /** Items */
@@ -1620,6 +1628,16 @@ export interface components {
        */
       details_submitted_at: string | null
       /**
+       * Onboarding Resubmission Requested At
+       * @description When Polar requested that the organization review and resubmit its onboarding information, if applicable.
+       */
+      onboarding_resubmission_requested_at: string | null
+      /**
+       * Sso Enforced
+       * @description Whether members must access this organization through its SSO connection.
+       */
+      sso_enforced: boolean
+      /**
        * Default Presentment Currency
        * @description Default presentment currency. Used as fallback in checkout and customer portal, if the customer's local currency is not available.
        */
@@ -1636,6 +1654,16 @@ export interface components {
       customer_email_settings: components['schemas']['OrganizationCustomerEmailSettings']
       /** @description Settings related to the customer portal */
       customer_portal_settings: components['schemas']['OrganizationCustomerPortalSettings']
+      /**
+       * Embed Hosts
+       * @description Hosts allowed to embed this organization's checkout. An entry is a host and an optional port, without a scheme: HTTPS is always allowed, and HTTP too for local hosts — `localhost`, any `.localhost` or `.local` name, and loopback or private addresses. `*.example.com` matches any subdomain, but not `example.com` itself. An app origin such as `chrome-extension://abcdef` carries its scheme, having no host to match on.
+       */
+      embed_hosts: string[]
+      /**
+       * Embed Hosts Enforced
+       * @description Whether an embedding page's origin must match `embed_hosts`. Organizations that have not configured a list yet embed unchecked until the allowlist is enforced for everyone.
+       */
+      embed_hosts_enforced: boolean
       /**
        * @description Two-letter country code (ISO 3166-1 alpha-2).
        * @default null
@@ -1927,25 +1955,6 @@ export interface components {
       /** Url */
       url: string
     }
-    /** OrganizationAccountUnlinkEmail */
-    OrganizationAccountUnlinkEmail: {
-      /**
-       * Template
-       * @default organization_account_unlink
-       * @constant
-       */
-      template: 'organization_account_unlink'
-      props: components['schemas']['OrganizationAccountUnlinkProps']
-    }
-    /** OrganizationAccountUnlinkProps */
-    OrganizationAccountUnlinkProps: {
-      /** Email */
-      email: string
-      /** Organization Kept Name */
-      organization_kept_name: string
-      /** Organizations Unlinked */
-      organizations_unlinked: string[]
-    }
     /** OrganizationCapabilities */
     OrganizationCapabilities: {
       /**
@@ -1983,6 +1992,8 @@ export interface components {
     OrganizationCustomerEmailSettings: {
       /** Order Confirmation */
       order_confirmation: boolean
+      /** Payment Method Expiration Reminder */
+      payment_method_expiration_reminder: boolean
       /** Subscription Cancellation */
       subscription_cancellation: boolean
       /** Subscription Confirmation */
@@ -1993,6 +2004,10 @@ export interface components {
       subscription_cycled_after_trial: boolean
       /** Subscription Past Due */
       subscription_past_due: boolean
+      /** Subscription Paused */
+      subscription_paused: boolean
+      /** Subscription Resumed */
+      subscription_resumed: boolean
       /** Subscription Renewal Reminder */
       subscription_renewal_reminder: boolean
       /** Subscription Revoked */
@@ -2072,6 +2087,30 @@ export interface components {
        * @default false
        */
       preview_access_enabled: boolean
+      /**
+       * Disputes Enabled
+       * @description If this organization has the disputes dashboard enabled
+       * @default false
+       */
+      disputes_enabled: boolean
+      /**
+       * Sso Enabled
+       * @description If this organization has single sign-on configuration enabled
+       * @default false
+       */
+      sso_enabled: boolean
+      /**
+       * Compass Enabled
+       * @description If this organization has the split product navigation (Billing / Compass / Customers) enabled in the dashboard
+       * @default false
+       */
+      compass_enabled: boolean
+      /**
+       * Merchant Migration Enabled
+       * @description If this organization can migrate its billing from another provider (e.g. Stripe) to Polar.
+       * @default false
+       */
+      merchant_migration_enabled: boolean
     }
     /** OrganizationInviteEmail */
     OrganizationInviteEmail: {
@@ -2093,6 +2132,25 @@ export interface components {
       inviter_email: string
       /** Invite Url */
       invite_url: string
+    }
+    /** OrganizationOffboardedEmail */
+    OrganizationOffboardedEmail: {
+      /**
+       * Template
+       * @default organization_offboarded
+       * @constant
+       */
+      template: 'organization_offboarded'
+      props: components['schemas']['OrganizationOffboardedProps']
+    }
+    /** OrganizationOffboardedProps */
+    OrganizationOffboardedProps: {
+      /** Email */
+      email: string
+      /** Organization Name */
+      organization_name: string
+      /** Account Url */
+      account_url: string
     }
     /** OrganizationSocialLink */
     OrganizationSocialLink: {
@@ -2132,6 +2190,7 @@ export interface components {
       | 'active'
       | 'blocked'
       | 'offboarding'
+      | 'offboarded'
     /** OrganizationSubscriptionSettings */
     OrganizationSubscriptionSettings: {
       /** Allow Multiple Subscriptions */
@@ -2148,6 +2207,82 @@ export interface components {
       /** Allow Customer Updates */
       allow_customer_updates: boolean
     }
+    /** PaymentMethodCard */
+    PaymentMethodCard: {
+      /**
+       * Id
+       * Format: uuid4
+       * @description The ID of the object.
+       */
+      id: string
+      /**
+       * Created At
+       * Format: date-time
+       * @description Creation timestamp of the object.
+       */
+      created_at: string
+      /**
+       * Modified At
+       * @description Last modification timestamp of the object.
+       */
+      modified_at: string | null
+      processor: components['schemas']['PaymentProcessor']
+      /**
+       * Customer Id
+       * Format: uuid4
+       */
+      customer_id: string
+      /**
+       * Type
+       * @constant
+       */
+      type: 'card'
+      method_metadata: components['schemas']['PaymentMethodCardMetadata']
+    }
+    /** PaymentMethodCardMetadata */
+    PaymentMethodCardMetadata: {
+      /** Brand */
+      brand: string
+      /** Last4 */
+      last4: string
+      /** Exp Month */
+      exp_month: number
+      /** Exp Year */
+      exp_year: number
+      /**
+       * Wallet
+       * @default null
+       */
+      wallet: string | null
+    }
+    /** PaymentMethodExpirationReminderEmail */
+    PaymentMethodExpirationReminderEmail: {
+      /**
+       * Template
+       * @default payment_method_expiration_reminder
+       * @constant
+       */
+      template: 'payment_method_expiration_reminder'
+      props: components['schemas']['PaymentMethodExpirationReminderProps']
+    }
+    /** PaymentMethodExpirationReminderProps */
+    PaymentMethodExpirationReminderProps: {
+      /** Email */
+      email: string
+      organization: components['schemas']['Organization']
+      payment_method: components['schemas']['PaymentMethodCard']
+      /** Product Names */
+      product_names: string[]
+      /** Expiration Date */
+      expiration_date: string
+      /** Url */
+      url: string
+    }
+    /**
+     * PaymentProcessor
+     * @enum {string}
+     */
+    PaymentProcessor: 'stripe'
     /** PersonalAccessTokenLeakedEmail */
     PersonalAccessTokenLeakedEmail: {
       /**
@@ -2188,6 +2323,28 @@ export interface components {
       /** Billing Url */
       billing_url: string
     }
+    /** PolarSelfSubscriptionCancellationEmail */
+    PolarSelfSubscriptionCancellationEmail: {
+      /**
+       * Template
+       * @default polar_self_subscription_cancellation
+       * @constant
+       */
+      template: 'polar_self_subscription_cancellation'
+      props: components['schemas']['PolarSelfSubscriptionCancellationProps']
+    }
+    /** PolarSelfSubscriptionCancellationProps */
+    PolarSelfSubscriptionCancellationProps: {
+      /** Email */
+      email: string
+      /** Product Name */
+      product_name: string
+      /**
+       * Ends At
+       * @default null
+       */
+      ends_at: string | null
+    }
     /** PolarSelfSubscriptionConfirmationEmail */
     PolarSelfSubscriptionConfirmationEmail: {
       /**
@@ -2217,6 +2374,40 @@ export interface components {
     }
     /** PolarSelfSubscriptionCycledProps */
     PolarSelfSubscriptionCycledProps: {
+      /** Email */
+      email: string
+      /** Product Name */
+      product_name: string
+    }
+    /** PolarSelfSubscriptionPastDueEmail */
+    PolarSelfSubscriptionPastDueEmail: {
+      /**
+       * Template
+       * @default polar_self_subscription_past_due
+       * @constant
+       */
+      template: 'polar_self_subscription_past_due'
+      props: components['schemas']['PolarSelfSubscriptionPastDueProps']
+    }
+    /** PolarSelfSubscriptionPastDueProps */
+    PolarSelfSubscriptionPastDueProps: {
+      /** Email */
+      email: string
+      /** Product Name */
+      product_name: string
+    }
+    /** PolarSelfSubscriptionRevokedEmail */
+    PolarSelfSubscriptionRevokedEmail: {
+      /**
+       * Template
+       * @default polar_self_subscription_revoked
+       * @constant
+       */
+      template: 'polar_self_subscription_revoked'
+      props: components['schemas']['PolarSelfSubscriptionRevokedProps']
+    }
+    /** PolarSelfSubscriptionRevokedProps */
+    PolarSelfSubscriptionRevokedProps: {
       /** Email */
       email: string
       /** Product Name */
@@ -2261,14 +2452,19 @@ export interface components {
       /** @description The visibility of the product. */
       visibility: components['schemas']['ProductVisibility']
       /** @description The recurring interval of the product. If `None`, the product is a one-time purchase. */
-      recurring_interval:
-        | components['schemas']['SubscriptionRecurringInterval']
-        | null
+      recurring_interval: components['schemas']['RecurringInterval'] | null
       /**
        * Recurring Interval Count
        * @description Number of interval units of the subscription. If this is set to 1 the charge will happen every interval (e.g. every month), if set to 2 it will be every other month, and so on. None for one-time products.
        */
       recurring_interval_count: number | null
+      /** @description The meter cycle of the product, independent of the billing interval. If `None`, metered concerns follow the billing interval. */
+      meter_interval: components['schemas']['RecurringInterval'] | null
+      /**
+       * Meter Interval Count
+       * @description Number of meter interval units. None when no meter cycle is set.
+       */
+      meter_interval_count: number | null
       /**
        * Is Recurring
        * @description Whether the product is a subscription.
@@ -2296,6 +2492,11 @@ export interface components {
      * @enum {string}
      */
     ProductVisibility: 'draft' | 'private' | 'public'
+    /**
+     * RecurringInterval
+     * @enum {string}
+     */
+    RecurringInterval: 'day' | 'week' | 'month' | 'year'
     /** SeatInvitationEmail */
     SeatInvitationEmail: {
       /**
@@ -2436,7 +2637,7 @@ export interface components {
        * @description The interval at which the subscription recurs.
        * @example month
        */
-      recurring_interval: components['schemas']['SubscriptionRecurringInterval']
+      recurring_interval: components['schemas']['RecurringInterval']
       /**
        * Recurring Interval Count
        * @description Number of interval units of the subscription. If this is set to 1 the charge will happen every interval (e.g. every month), if set to 2 it will be every other month, and so on.
@@ -2459,6 +2660,16 @@ export interface components {
        * @description The end timestamp of the current billing period.
        */
       current_period_end: string
+      /**
+       * Current Meter Period Start
+       * @description The start timestamp of the current meter period, if the product has a meter cycle set. Metered credits are granted and overage is settled on this cadence.
+       */
+      current_meter_period_start: string | null
+      /**
+       * Current Meter Period End
+       * @description The end timestamp of the current meter period, if the product has a meter cycle set. This is when credits next renew.
+       */
+      current_meter_period_end: string | null
       /**
        * Trial Start
        * @description The start timestamp of the trial period, if any.
@@ -2494,6 +2705,27 @@ export interface components {
        * @description The timestamp when the subscription ended.
        */
       ended_at: string | null
+      /**
+       * Past Due At
+       * @description The timestamp when the subscription entered `past_due` status.
+       * @default null
+       */
+      past_due_at: string | null
+      /**
+       * Pause At Period End
+       * @description Whether the subscription will be paused at the end of the current period.
+       */
+      pause_at_period_end: boolean
+      /**
+       * Paused At
+       * @description The timestamp when the subscription was paused.
+       */
+      paused_at: string | null
+      /**
+       * Resumes At
+       * @description The timestamp when a paused subscription is scheduled to automatically resume, if set.
+       */
+      resumes_at: string | null
       /**
        * Customer Id
        * Format: uuid4
@@ -2566,10 +2798,35 @@ export interface components {
       /** Url */
       url: string
       /**
-       * Payment Url
+       * Access Ends At
        * @default null
        */
-      payment_url: string | null
+      access_ends_at: string | null
+      /**
+       * Deadline
+       * @default null
+       */
+      deadline: string | null
+    }
+    /** SubscriptionPausedEmail */
+    SubscriptionPausedEmail: {
+      /**
+       * Template
+       * @default subscription_paused
+       * @constant
+       */
+      template: 'subscription_paused'
+      props: components['schemas']['SubscriptionPausedProps']
+    }
+    /** SubscriptionPausedProps */
+    SubscriptionPausedProps: {
+      /** Email */
+      email: string
+      organization: components['schemas']['Organization']
+      product: components['schemas']['ProductEmail']
+      subscription: components['schemas']['SubscriptionEmail']
+      /** Url */
+      url: string
     }
     /**
      * SubscriptionProrationBehavior
@@ -2580,11 +2837,6 @@ export interface components {
       | 'prorate'
       | 'next_period'
       | 'reset'
-    /**
-     * SubscriptionRecurringInterval
-     * @enum {string}
-     */
-    SubscriptionRecurringInterval: 'day' | 'week' | 'month' | 'year'
     /** SubscriptionRenewalReminderEmail */
     SubscriptionRenewalReminderEmail: {
       /**
@@ -2606,6 +2858,26 @@ export interface components {
       url: string
       /** Renewal Date */
       renewal_date: string
+    }
+    /** SubscriptionResumedEmail */
+    SubscriptionResumedEmail: {
+      /**
+       * Template
+       * @default subscription_resumed
+       * @constant
+       */
+      template: 'subscription_resumed'
+      props: components['schemas']['SubscriptionResumedProps']
+    }
+    /** SubscriptionResumedProps */
+    SubscriptionResumedProps: {
+      /** Email */
+      email: string
+      organization: components['schemas']['Organization']
+      product: components['schemas']['ProductEmail']
+      subscription: components['schemas']['SubscriptionEmail']
+      /** Url */
+      url: string
     }
     /** SubscriptionRevokedEmail */
     SubscriptionRevokedEmail: {
@@ -2639,6 +2911,7 @@ export interface components {
       | 'past_due'
       | 'canceled'
       | 'unpaid'
+      | 'paused'
     /** SubscriptionTrialConversionReminderEmail */
     SubscriptionTrialConversionReminderEmail: {
       /**

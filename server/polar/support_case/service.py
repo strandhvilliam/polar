@@ -1,12 +1,17 @@
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
-from polar.models import Customer, Dispute, File, Organization, User
+from polar.auth.models import AuthSubject, Organization, User
+from polar.kit.pagination import PaginationParams
+from polar.kit.sorting import Sorting
+from polar.models import Customer, Dispute, File, Order
+from polar.models.dispute import DisputeStatus
 from polar.models.support_case import (
     DisputeSupportCase,
-    ReviewAppealSupportCase,
     SupportCase,
     SupportCaseAttachment,
     SupportCaseAudience,
@@ -20,13 +25,12 @@ from polar.models.support_case import (
 from polar.postgres import AsyncReadSession, AsyncSession
 
 from .repository import (
-    DisputeSupportCaseRepository,
-    ReviewAppealSupportCaseRepository,
     SupportCaseAttachmentRepository,
     SupportCaseMessageRepository,
     SupportCaseParticipantRepository,
     SupportCaseRepository,
 )
+from .sorting import SupportCaseSortProperty
 
 
 class SupportCaseService:
@@ -52,29 +56,108 @@ class SupportCaseService:
         )
         return case
 
-    async def get_organization_id(
-        self, session: AsyncSession | AsyncReadSession, case: SupportCase
-    ) -> UUID | None:
-        """The organization that owns a case, resolved through its domain object."""
-        if case.type == SupportCaseType.review_appeal:
-            appeal = await ReviewAppealSupportCaseRepository.from_session(
-                session
-            ).get_by_id(
-                case.id,
-                options=(joinedload(ReviewAppealSupportCase.organization_review),),
+    async def get(
+        self,
+        session: AsyncSession | AsyncReadSession,
+        auth_subject: AuthSubject[User | Organization],
+        case_id: UUID,
+    ) -> SupportCase | None:
+        """A case the subject is allowed to read, by id. Org-manage scoped."""
+        repository = SupportCaseRepository.from_session(session)
+        statement = repository.get_readable_statement(auth_subject).where(
+            SupportCase.id == case_id
+        )
+        return await repository.get_one_or_none(statement)
+
+    async def list(
+        self,
+        session: AsyncReadSession,
+        auth_subject: AuthSubject[User | Organization],
+        *,
+        organization_id: Sequence[UUID] | None = None,
+        type: Sequence[SupportCaseType] | None = None,
+        dispute_status: Sequence[DisputeStatus] | None = None,
+        pagination: PaginationParams,
+        sorting: list[Sorting[SupportCaseSortProperty]],
+    ) -> tuple[Sequence[SupportCase], int]:
+        """Cases the subject may read, filtered by type and (for dispute cases)
+        the linked dispute's status. Dispute cases embed their dispute."""
+        repository = SupportCaseRepository.from_session(session)
+        statement = repository.get_readable_statement(auth_subject)
+        if organization_id is not None:
+            statement = statement.where(
+                SupportCase.organization_id.in_(organization_id)
             )
-            return appeal.organization_review.organization_id if appeal else None
-        if case.type == SupportCaseType.dispute:
-            dispute_case = await DisputeSupportCaseRepository.from_session(
-                session
-            ).get_by_id(
-                case.id,
-                options=(
-                    joinedload(DisputeSupportCase.dispute).joinedload(Dispute.order),
-                ),
+        if type is not None:
+            statement = statement.where(SupportCase.type.in_(type))
+        if dispute_status is not None:
+            statement = statement.where(
+                DisputeSupportCase.dispute_id.in_(
+                    select(Dispute.id).where(Dispute.status.in_(dispute_status))
+                )
             )
-            return dispute_case.dispute.order.organization_id if dispute_case else None
-        return None
+        statement = statement.options(
+            joinedload(DisputeSupportCase.dispute)
+            .joinedload(Dispute.order)
+            .joinedload(Order.customer)
+        )
+        statement = repository.apply_sorting(statement, sorting)
+        return await repository.paginate(
+            statement, limit=pagination.limit, page=pagination.page
+        )
+
+    async def get_thread(
+        self,
+        session: AsyncSession | AsyncReadSession,
+        case: SupportCase,
+        *,
+        visible_to: SupportCaseAudience | None,
+    ) -> tuple[bool, Sequence[SupportCaseMessage]]:
+        """A case's open state and its messages visible to ``visible_to``."""
+        message_repository = SupportCaseMessageRepository.from_session(session)
+        is_open = await message_repository.is_open(case.id)
+        messages = await message_repository.list_by_case(case.id, visible_to=visible_to)
+        return is_open, messages
+
+    async def list_attachments(
+        self,
+        session: AsyncSession | AsyncReadSession,
+        case: SupportCase,
+        *,
+        visible_to: SupportCaseAudience | None,
+    ) -> Sequence[SupportCaseAttachment]:
+        repository = SupportCaseAttachmentRepository.from_session(session)
+        return await repository.list_by_case(case.id, visible_to=visible_to)
+
+    async def get_attachment(
+        self,
+        session: AsyncSession | AsyncReadSession,
+        case: SupportCase,
+        attachment_id: UUID,
+        *,
+        visible_to: SupportCaseAudience | None,
+    ) -> SupportCaseAttachment | None:
+        repository = SupportCaseAttachmentRepository.from_session(session)
+        attachment = await repository.get_by_id_for_case(attachment_id, case.id)
+        if attachment is None:
+            return None
+        if visible_to is not None and visible_to not in attachment.audience:
+            return None
+        return attachment
+
+    async def mark_read(
+        self, session: AsyncSession, case: SupportCase, *, user: User
+    ) -> SupportCaseParticipant:
+        """Record that a staff member has read the case up to now.
+
+        Upserts the staff member's ``platform`` participant and stamps
+        ``last_read_at``. Per-staff: each viewer tracks their own read state,
+        and the latest reader across staff is shown in the list.
+        """
+        repository = SupportCaseParticipantRepository.from_session(session)
+        return await repository.upsert_platform_read(
+            case.id, user.id, read_at=datetime.now(UTC)
+        )
 
     async def add_participant(
         self,

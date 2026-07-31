@@ -3,14 +3,15 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, TypedDict
 from uuid import UUID
 
-from annotated_types import Ge, Le, Len, MinLen
+from annotated_types import Ge, Len, MinLen
 from pydantic import AfterValidator, Field, ValidationInfo
-from sqlalchemy import ForeignKey, String, UniqueConstraint, Uuid
+from sqlalchemy import ForeignKey, Index, String, Uuid, text
 from sqlalchemy.dialects.postgresql import CITEXT, JSONB
 from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 
 from polar.kit.db.models import RecordModel
 from polar.kit.metadata import MetadataMixin
+from polar.kit.schemas import Int32
 
 if TYPE_CHECKING:
     from polar.models import Organization
@@ -36,8 +37,8 @@ class CustomFieldType(StrEnum):
         }[self]
 
 
-PositiveBoundedInt = Annotated[int, Ge(0), Le(INT32_MAX)]
-BoundedInt = Annotated[int, Ge(INT32_MIN), Le(INT32_MAX)]
+PositiveBoundedInt = Annotated[Int32, Ge(0)]
+BoundedInt = Int32
 NonEmptyString = Annotated[str, Len(min_length=1)]
 
 
@@ -92,14 +93,23 @@ class CustomFieldSelectProperties(CustomFieldProperties):
 
 class CustomField(MetadataMixin, RecordModel):
     __tablename__ = "custom_fields"
-    __table_args__ = (UniqueConstraint("slug", "organization_id"),)
+    __table_args__ = (
+        # Partial unique index: slugs of soft-deleted fields can be reused
+        Index(
+            "custom_fields_slug_organization_id_active_key",
+            "slug",
+            "organization_id",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
 
     type: Mapped[CustomFieldType] = mapped_column(String, nullable=False, index=True)
     slug: Mapped[str] = mapped_column(
         CITEXT,
         nullable=False,
         # Don't create an index for slug
-        # as it's covered by the unique constraint, being the leading column of it
+        # as it's covered by the unique index, being the leading column of it
         index=False,
     )
     name: Mapped[str] = mapped_column(String, nullable=False)

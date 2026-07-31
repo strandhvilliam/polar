@@ -1,20 +1,32 @@
-"""Tests for organization_review.tasks – SUBMISSION re-run + appeal review paths."""
+"""Tests for organization_review.tasks – SUBMISSION re-run, PRODUCT_CHANGED
+escalation, and appeal review paths."""
 
 import contextlib
+import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import update
 
-from polar.models.organization import Organization, OrganizationStatus
+from polar.models.organization import (
+    STATUS_CAPABILITIES,
+    Organization,
+    OrganizationStatus,
+)
 from polar.models.organization_review import OrganizationReview
 from polar.organization.repository import (
     OrganizationReviewRepository as OrgReviewRepository,
 )
+from polar.organization_review.repository import (
+    OrganizationReviewRepository as AgentReviewRepository,
+)
 from polar.organization_review.schemas import (
+    ActorType,
     AgentReviewResult,
     DataSnapshot,
+    DecisionType,
     DimensionAssessment,
     HistoryData,
     IdentityData,
@@ -29,7 +41,11 @@ from polar.organization_review.schemas import (
     RiskLevel,
     UsageInfo,
 )
-from polar.organization_review.tasks import review_appeal, run_review_agent
+from polar.organization_review.tasks import (
+    _run_agent_debounce_key,
+    review_appeal,
+    run_review_agent,
+)
 from polar.postgres import AsyncSession
 from tests.fixtures.database import SaveFixture
 
@@ -153,6 +169,74 @@ class TestRunReviewAgentSubmission:
         assert updated.violated_sections == []
         assert updated.timed_out is False
         assert updated.organization_details_snapshot["name"] == organization.name
+
+    async def test_reset_while_agent_is_running_discards_stale_result(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        submitted_at = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
+        reset_requested_at = datetime(2026, 7, 28, 10, 1, tzinfo=UTC)
+        organization.status = OrganizationStatus.ACTIVE
+        organization.capabilities = {**STATUS_CAPABILITIES[OrganizationStatus.ACTIVE]}
+        organization.details_submitted_at = submitted_at
+        await session.flush()
+
+        agent_result = _make_agent_result(
+            verdict=ReviewVerdict.DENY,
+            risk_level=RiskLevel.HIGH,
+        )
+
+        async def reset_organization_during_review(
+            *_args: object, **_kwargs: object
+        ) -> AgentReviewResult:
+            await session.execute(
+                update(Organization)
+                .where(Organization.id == organization.id)
+                .values(
+                    status=OrganizationStatus.CREATED,
+                    capabilities=STATUS_CAPABILITIES[OrganizationStatus.CREATED],
+                    details_submitted_at=None,
+                    onboarding_resubmission_requested_at=reset_requested_at,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            return agent_result
+
+        with (
+            patch(
+                "polar.organization_review.tasks.AsyncSessionMaker",
+                return_value=_mock_session_maker(session),
+            ),
+            patch(
+                "polar.organization_review.tasks.run_organization_review",
+                side_effect=reset_organization_during_review,
+            ),
+        ):
+            await _run_review_agent(
+                organization.id,
+                context=ReviewContext.SUBMISSION,
+            )
+
+        await session.flush()
+        session.expire_all()
+
+        await session.refresh(organization)
+        assert organization.status == OrganizationStatus.CREATED
+        assert organization.details_submitted_at is None
+        assert organization.onboarding_resubmission_requested_at == reset_requested_at
+
+        organization_review_repository = OrgReviewRepository.from_session(session)
+        assert (
+            await organization_review_repository.get_by_organization(organization.id)
+            is None
+        )
+
+        agent_review_repository = AgentReviewRepository.from_session(session)
+        assert (
+            await agent_review_repository.get_latest_agent_review(organization.id)
+            is None
+        )
 
     async def test_non_grandfathered_existing_review_is_overwritten(
         self,
@@ -436,6 +520,35 @@ class TestRunReviewAgentSubmission:
 
 
 @pytest.mark.asyncio
+class TestRunReviewAgentMissingOrganization:
+    """A deleted/missing organization must be skipped gracefully, not raise —
+    the org can disappear between enqueue and (debounced) execution."""
+
+    async def test_missing_organization_skips_without_raising(
+        self,
+        session: AsyncSession,
+    ) -> None:
+        run_review_mock = AsyncMock()
+        with (
+            patch(
+                "polar.organization_review.tasks.AsyncSessionMaker",
+                return_value=_mock_session_maker(session),
+            ),
+            patch(
+                "polar.organization_review.tasks.run_organization_review",
+                run_review_mock,
+            ),
+        ):
+            # A random id that does not correspond to any organization.
+            await _run_review_agent(
+                uuid.uuid4(),
+                context=ReviewContext.SUBMISSION,
+            )
+
+        run_review_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 class TestReviewAppeal:
     async def test_approve_activates_org(
         self,
@@ -573,3 +686,139 @@ class TestReviewAppeal:
             await _review_appeal(organization.id)
 
         run_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestRunReviewAgentProductChanged:
+    """PRODUCT_CHANGED re-reviews an active org when it creates or edits a
+    product. A bad verdict pulls it back into REVIEW for a human; a clean
+    APPROVE is a no-op. It never auto-denies."""
+
+    async def test_deny_pulls_active_org_into_review(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        # The `organization` fixture is ACTIVE by default.
+        agent_result = _make_agent_result(
+            verdict=ReviewVerdict.DENY,
+            risk_level=RiskLevel.HIGH,
+            merchant_summary="New product looks prohibited",
+            violated_sections=["Prohibited Products"],
+        )
+
+        with (
+            patch(
+                "polar.organization_review.tasks.AsyncSessionMaker",
+                return_value=_mock_session_maker(session),
+            ),
+            patch(
+                "polar.organization_review.tasks.run_organization_review",
+                new_callable=AsyncMock,
+                return_value=agent_result,
+            ),
+        ):
+            await _run_review_agent(
+                organization.id,
+                context=ReviewContext.PRODUCT_CHANGED,
+            )
+
+        await session.flush()
+        await session.refresh(organization)
+        assert organization.status == OrganizationStatus.REVIEW
+
+        agent_review_repo = AgentReviewRepository.from_session(session)
+        decision = await agent_review_repo.get_current_decision(organization.id)
+        assert decision is not None
+        assert decision.actor_type == ActorType.AGENT
+        assert decision.decision == DecisionType.ESCALATE
+        assert decision.review_context == ReviewContext.PRODUCT_CHANGED
+
+    async def test_approve_keeps_org_active(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        assert organization.status == OrganizationStatus.ACTIVE
+
+        agent_result = _make_agent_result(verdict=ReviewVerdict.APPROVE)
+
+        with (
+            patch(
+                "polar.organization_review.tasks.AsyncSessionMaker",
+                return_value=_mock_session_maker(session),
+            ),
+            patch(
+                "polar.organization_review.tasks.run_organization_review",
+                new_callable=AsyncMock,
+                return_value=agent_result,
+            ),
+        ):
+            await _run_review_agent(
+                organization.id,
+                context=ReviewContext.PRODUCT_CHANGED,
+            )
+
+        await session.flush()
+        await session.refresh(organization)
+        assert organization.status == OrganizationStatus.ACTIVE
+
+        agent_review_repo = AgentReviewRepository.from_session(session)
+        decision = await agent_review_repo.get_current_decision(organization.id)
+        assert decision is None
+
+    async def test_non_active_org_is_skipped(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        # The org was pulled into REVIEW (e.g. by the threshold flow) between
+        # the product-changed enqueue and the debounced execution. There is
+        # nothing to escalate, so the agent must not even run.
+        organization.set_status(OrganizationStatus.REVIEW)
+        await save_fixture(organization)
+
+        run_review_mock = AsyncMock()
+        with (
+            patch(
+                "polar.organization_review.tasks.AsyncSessionMaker",
+                return_value=_mock_session_maker(session),
+            ),
+            patch(
+                "polar.organization_review.tasks.run_organization_review",
+                run_review_mock,
+            ),
+        ):
+            await _run_review_agent(
+                organization.id,
+                context=ReviewContext.PRODUCT_CHANGED,
+            )
+
+        run_review_mock.assert_not_awaited()
+        await session.refresh(organization)
+        assert organization.status == OrganizationStatus.REVIEW
+
+
+class TestRunAgentDebounceKey:
+    """Only PRODUCT_CHANGED reviews are debounced (per organization)."""
+
+    def test_product_changed_returns_per_org_key(self) -> None:
+        organization_id = uuid.uuid4()
+        key = _run_agent_debounce_key(
+            organization_id, context=ReviewContext.PRODUCT_CHANGED
+        )
+        assert key == f"organization_review.product_changed:{organization_id}"
+
+    def test_other_contexts_are_not_debounced(self) -> None:
+        organization_id = uuid.uuid4()
+        assert (
+            _run_agent_debounce_key(organization_id, context=ReviewContext.THRESHOLD)
+            is None
+        )
+        assert (
+            _run_agent_debounce_key(organization_id, context=ReviewContext.SUBMISSION)
+            is None
+        )
+        # Default context is THRESHOLD — also not debounced.
+        assert _run_agent_debounce_key(organization_id) is None

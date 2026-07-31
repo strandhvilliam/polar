@@ -1,7 +1,8 @@
 import contextlib
 import typing
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
+from datetime import datetime
 
 import sentry_sdk
 import stripe as stripe_lib
@@ -18,6 +19,7 @@ from polar.authz.service import assert_resource_permission, get_accessible_org_i
 from polar.checkout.guard import has_product_checkout
 from polar.checkout.schemas import (
     CheckoutConfirm,
+    CheckoutConfirmBase,
     CheckoutConfirmStripe,
     CheckoutCreate,
     CheckoutPriceCreate,
@@ -89,6 +91,7 @@ from polar.observability.checkout_metrics import (
     CHECKOUT_SUCCEEDED_TOTAL,
 )
 from polar.order.service import order as order_service
+from polar.organization.embed_hosts import match_origin, parse_origin
 from polar.postgres import AsyncReadSession, AsyncSession
 from polar.posthog import posthog
 from polar.product.custom_price import validate_custom_price_amount
@@ -213,11 +216,33 @@ class TrialAlreadyRedeemed(CheckoutError):
         super().__init__(message, 403)
 
 
+class DiscountRedemptionLimitReached(CheckoutError):
+    def __init__(self, checkout: Checkout) -> None:
+        self.checkout = checkout
+        message = (
+            "You have already redeemed this discount the maximum number of "
+            "times allowed per customer."
+        )
+        super().__init__(message, 403)
+
+
 class CheckoutLocked(CheckoutError):
     """Raised when checkout is locked by another transaction."""
 
-    def __init__(self, checkout_id: uuid.UUID) -> None:
+    @typing.overload
+    def __init__(self, *, checkout_id: uuid.UUID) -> None: ...
+
+    @typing.overload
+    def __init__(self, *, checkout_secret: str) -> None: ...
+
+    def __init__(
+        self,
+        *,
+        checkout_id: uuid.UUID | None = None,
+        checkout_secret: str | None = None,
+    ) -> None:
         self.checkout_id = checkout_id
+        self.checkout_secret = checkout_secret
         message = "Checkout is currently being processed. Please try again."
         super().__init__(message, 409)
 
@@ -238,6 +263,13 @@ class CheckoutCustomerExternalIdMismatch(CheckoutError):
         super().__init__(message, 422)
 
 
+class EmbedHostNotAllowed(CheckoutError):
+    def __init__(self, embed_origin: str) -> None:
+        self.embed_origin = embed_origin
+        message = f"{embed_origin} is not allowed to embed this checkout."
+        super().__init__(message, 403)
+
+
 CHECKOUT_CLIENT_SECRET_PREFIX = "polar_c_"
 
 
@@ -253,6 +285,8 @@ class CheckoutService:
         external_customer_id: Sequence[str] | None = None,
         status: Sequence[CheckoutStatus] | None = None,
         query: str | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
         pagination: PaginationParams,
         sorting: list[Sorting[CheckoutSortProperty]] = [
             (CheckoutSortProperty.created_at, True)
@@ -286,6 +320,12 @@ class CheckoutService:
         if query is not None:
             statement = statement.where(Checkout.customer_email.ilike(f"%{query}%"))
 
+        if created_after is not None:
+            statement = statement.where(Checkout.created_at > created_after)
+
+        if created_before is not None:
+            statement = statement.where(Checkout.created_at < created_before)
+
         statement = repository.apply_sorting(statement, sorting)
 
         return await repository.paginate(
@@ -297,6 +337,8 @@ class CheckoutService:
         session: AsyncReadSession,
         auth_subject: AuthSubject[User | Organization],
         id: uuid.UUID,
+        *,
+        for_update: bool = False,
     ) -> Checkout | None:
         repository = CheckoutRepository.from_session(session)
         org_ids = await get_accessible_org_ids(
@@ -307,7 +349,15 @@ class CheckoutService:
             .where(Checkout.id == id)
             .options(*repository.get_eager_options())
         )
-        checkout = await repository.get_one_or_none(statement)
+        if for_update:
+            statement = statement.with_for_update(of=Checkout, nowait=True)
+
+        try:
+            checkout = await repository.get_one_or_none(statement)
+        except DBAPIError as e:
+            if is_lock_not_available_error(e):
+                raise CheckoutLocked(checkout_id=id) from e
+            raise
 
         if checkout is None:
             return None
@@ -656,6 +706,26 @@ class CheckoutService:
         query_prefill: dict[str, str | UUID4 | dict[str, str] | None] | None = None,
         **query_metadata: str | None,
     ) -> Checkout:
+        if embed_origin is not None:
+            organization = checkout_link.organization
+            parsed_embed_origin = parse_origin(embed_origin)
+            if parsed_embed_origin is None:
+                embed_origin = None
+            elif organization.embed_hosts_enforced:
+                embed_origin = match_origin(
+                    str(parsed_embed_origin), organization.embed_hosts
+                )
+                if embed_origin is None:
+                    log.warning(
+                        "Embedded checkout refused: origin is not an allowed embed host",
+                        organization_id=str(organization.id),
+                        embed_origin=str(parsed_embed_origin),
+                        embed_hosts=organization.embed_hosts,
+                    )
+                    raise EmbedHostNotAllowed(str(parsed_embed_origin))
+            else:
+                embed_origin = str(parsed_embed_origin)
+
         products: list[Product] = []
         for product in checkout_link.products:
             if not product.is_archived and product.visibility != Visibility.draft:
@@ -900,27 +970,19 @@ class CheckoutService:
         checkout_update: CheckoutUpdate | CheckoutUpdatePublic,
         ip_geolocation_client: ip_geolocation.IPGeolocationClient | None = None,
     ) -> Checkout:
-        async with self._lock_checkout_update(session, checkout) as checkout:
-            checkout = await self._update_checkout(
-                session, checkout, checkout_update, ip_geolocation_client
-            )
-            try:
-                checkout = await self._update_checkout_tax(session, checkout)
-            # Swallow incomplete tax calculation error: require it only on confirm
-            except TaxCalculationLogicalError:
-                pass
+        checkout = await self._update_checkout(
+            session, checkout, checkout_update, ip_geolocation_client
+        )
+        try:
+            checkout = await self._update_checkout_tax(session, checkout)
+        # Swallow incomplete tax calculation error: require it only on confirm
+        except TaxCalculationLogicalError:
+            pass
 
-            # Reset is_business_customer if payment form is no longer required
-            # This handles the case where a 100% discount is applied and the
-            # billing address section disappears from the frontend
-            if (
-                not checkout.is_payment_form_required
-                and not checkout.require_billing_address
-            ):
-                checkout.is_business_customer = False
+        self._reset_payment_form_fields_if_needed(checkout)
 
-            await self._after_checkout_updated(session, checkout)
-            return checkout
+        await self._after_checkout_updated(session, checkout)
+        return checkout
 
     async def confirm(
         self,
@@ -929,33 +991,32 @@ class CheckoutService:
         checkout: Checkout,
         checkout_confirm: CheckoutConfirm,
     ) -> Checkout:
-        async with self._lock_checkout_update(session, checkout) as checkout:
-            checkout = await self._update_checkout(session, checkout, checkout_confirm)
-            # When redeeming a discount, we need to lock the discount to prevent concurrent redemptions
-            if checkout.discount is not None:
-                try:
-                    async with discount_service.redeem_discount(
-                        session, checkout.discount
-                    ) as discount_redemption:
-                        discount_redemption.checkout = checkout
-                        return await self._confirm_inner(
-                            session, auth_subject, checkout, checkout_confirm
-                        )
-                except DiscountNotRedeemableError as e:
-                    raise PolarRequestValidationError(
-                        [
-                            {
-                                "type": "value_error",
-                                "loc": ("body", "discount_id"),
-                                "msg": "Discount is no longer redeemable.",
-                                "input": checkout.discount.id,
-                            }
-                        ]
-                    ) from e
+        checkout = await self._update_checkout(session, checkout, checkout_confirm)
+        # When redeeming a discount, we need to lock the discount to prevent concurrent redemptions
+        if checkout.discount is not None:
+            try:
+                async with discount_service.redeem_discount(
+                    session, checkout.discount
+                ) as discount_redemption:
+                    discount_redemption.checkout = checkout
+                    return await self._confirm_inner(
+                        session, auth_subject, checkout, checkout_confirm
+                    )
+            except DiscountNotRedeemableError as e:
+                raise PolarRequestValidationError(
+                    [
+                        {
+                            "type": "value_error",
+                            "loc": ("body", "discount_id"),
+                            "msg": "Discount is no longer redeemable.",
+                            "input": checkout.discount.id,
+                        }
+                    ]
+                ) from e
 
-            return await self._confirm_inner(
-                session, auth_subject, checkout, checkout_confirm
-            )
+        return await self._confirm_inner(
+            session, auth_subject, checkout, checkout_confirm
+        )
 
     async def _confirm_inner(
         self,
@@ -968,6 +1029,17 @@ class CheckoutService:
         try:
             checkout = await self._update_checkout_tax(session, checkout)
         except TaxCalculationLogicalError as e:
+            billing_address = checkout.customer_billing_address
+            log.warning(
+                "Checkout confirmation blocked by tax calculation error",
+                error_type=type(e).__name__,
+                error_message=e.message,
+                checkout_id=str(checkout.id),
+                organization_id=str(checkout.organization_id),
+                product_id=str(checkout.product_id) if checkout.product_id else None,
+                billing_country=billing_address.country if billing_address else None,
+                billing_state=billing_address.state if billing_address else None,
+            )
             errors.append(
                 {
                     "type": "value_error",
@@ -976,6 +1048,8 @@ class CheckoutService:
                     "input": None,
                 }
             )
+
+        self._reset_payment_form_fields_if_needed(checkout)
 
         # Case where the price was archived after the checkout was created
         if has_product_checkout(checkout) and checkout.product_price.is_archived:
@@ -995,30 +1069,37 @@ class CheckoutService:
             if checkout.is_payment_setup_required:
                 raise PaymentNotReady()
 
-        # For wallet payments (Apple Pay, Google Pay, Link), we hide the customer name
-        # field for better UX and instead extract the name from Stripe's confirmation token.
+        confirmation_token: stripe_lib.ConfirmationToken | None = None
         if (
             checkout.payment_processor == PaymentProcessor.stripe
             and checkout_confirm.confirmation_token_id is not None
-            and checkout.customer_name is None
+            and (
+                checkout.customer_name is None
+                or (
+                    checkout.discount is not None
+                    and checkout.discount.max_redemptions_per_customer is not None
+                )
+            )
         ):
             try:
                 confirmation_token = await stripe_service.get_confirmation_token(
                     checkout_confirm.confirmation_token_id
                 )
-                if (
-                    confirmation_token.payment_method_preview is not None
-                    and confirmation_token.payment_method_preview.billing_details
-                    is not None
-                ):
-                    wallet_name = (
-                        confirmation_token.payment_method_preview.billing_details.name
-                    )
-                    if wallet_name:
-                        checkout.customer_name = wallet_name
-                        session.add(checkout)
             except stripe_lib.StripeError:
-                pass
+                confirmation_token = None
+
+        # For wallet payments (Apple Pay, Google Pay, Link), we hide the customer name
+        # field for better UX and instead extract the name from Stripe's confirmation token.
+        if confirmation_token is not None and checkout.customer_name is None:
+            payment_method_preview = confirmation_token.payment_method_preview
+            if (
+                payment_method_preview is not None
+                and payment_method_preview.billing_details is not None
+            ):
+                wallet_name = payment_method_preview.billing_details.name
+                if wallet_name:
+                    checkout.customer_name = wallet_name
+                    session.add(checkout)
 
         required_fields = self._get_required_confirm_fields(checkout)
         for required_field in required_fields:
@@ -1035,7 +1116,7 @@ class CheckoutService:
                     }
                 )
 
-        if checkout.require_billing_address or checkout.is_business_customer:
+        if checkout.is_billing_address_required:
             if (
                 checkout.customer_billing_address is None
                 or not checkout.customer_billing_address.has_address()
@@ -1076,6 +1157,39 @@ class CheckoutService:
                     **checkout.payment_processor_metadata,
                     "customer_id": stripe_customer_id,
                 }
+
+                # Enforce the per-customer discount redemption limit *before* creating
+                # any payment intent, so we never charge a customer we're about to
+                # reject. The card fingerprint is read from the confirmation token's
+                # payment method preview (no intent/charge required yet).
+                if (
+                    checkout.discount is not None
+                    and checkout.discount.max_redemptions_per_customer is not None
+                ):
+                    # Serialize concurrent confirmations of the same buyer, so two
+                    # checkouts can't both read the count before either redeems.
+                    customer_repository = CustomerRepository.from_session(session)
+                    await customer_repository.get_by_id(customer.id, for_update=True)
+
+                    payment_method_fingerprint: str | None = None
+                    if (
+                        confirmation_token is not None
+                        and confirmation_token.payment_method_preview is not None
+                    ):
+                        payment_method_fingerprint = get_fingerprint(
+                            typing.cast(
+                                stripe_lib.PaymentMethod,
+                                confirmation_token.payment_method_preview,
+                            )
+                        )
+                    if await discount_service.check_per_customer_limit_reached(
+                        session,
+                        checkout.discount,
+                        checkout=checkout,
+                        customer=customer,
+                        payment_method_fingerprint=payment_method_fingerprint,
+                    ):
+                        raise DiscountRedemptionLimitReached(checkout)
 
                 intent: stripe_lib.PaymentIntent | stripe_lib.SetupIntent | None = None
                 if checkout.is_payment_form_required:
@@ -1433,20 +1547,33 @@ class CheckoutService:
         return checkout
 
     async def get_by_client_secret(
-        self, session: AsyncSession, client_secret: str
+        self, session: AsyncSession, client_secret: str, *, for_update: bool = False
     ) -> Checkout:
         repository = CheckoutRepository.from_session(session)
-        checkout = await repository.get_by_client_secret(
-            client_secret, options=repository.get_eager_options()
-        )
+        if for_update:
+            try:
+                checkout = await repository.get_by_client_secret(
+                    client_secret,
+                    options=repository.get_eager_options(),
+                    for_update=True,
+                    nowait=True,
+                )
+            except DBAPIError as e:
+                if is_lock_not_available_error(e):
+                    raise CheckoutLocked(checkout_secret=client_secret) from e
+                raise
+        else:
+            checkout = await repository.get_by_client_secret(
+                client_secret, options=repository.get_eager_options()
+            )
         if checkout is None:
             raise ResourceNotFound()
 
-        if not checkout.organization.can_authenticate:
-            raise NotPermitted()
-
         if checkout.is_expired:
             raise ExpiredCheckoutError()
+
+        if not checkout.organization.can_authenticate:
+            raise NotPermitted()
         return checkout
 
     async def mark_opened(
@@ -1870,41 +1997,6 @@ class CheckoutService:
 
         return subscription, subscription.customer
 
-    @contextlib.asynccontextmanager
-    async def _lock_checkout_update(
-        self, session: AsyncSession, checkout: Checkout
-    ) -> AsyncIterator[Checkout]:
-        """
-        Lock checkout with FOR UPDATE NOWAIT and reload fresh from database.
-
-        Uses PostgreSQL row-level locking instead of Redis distributed locks.
-        If another transaction holds the lock, immediately raises CheckoutLocked
-        instead of waiting (NOWAIT behavior).
-
-        Uses FOR UPDATE OF checkouts to lock only the checkout row while still
-        allowing eager loading of relationships via LEFT OUTER JOINs.
-
-        See: https://www.postgresql.org/docs/current/explicit-locking.html
-        """
-        repository = CheckoutRepository.from_session(session)
-        checkout_id = checkout.id
-
-        try:
-            locked_checkout = await repository.get_by_id_for_update(
-                checkout_id,
-                nowait=True,
-                options=repository.get_eager_options(),
-            )
-        except DBAPIError as e:
-            if is_lock_not_available_error(e):
-                raise CheckoutLocked(checkout_id) from e
-            raise
-
-        if locked_checkout is None:
-            raise ResourceNotFound()
-
-        yield locked_checkout
-
     async def _update_checkout(
         self,
         session: AsyncSession,
@@ -2170,16 +2262,22 @@ class CheckoutService:
                         ]
                     ) from e
 
-        if (
-            has_product_checkout(checkout)
-            and checkout_update.custom_field_data is not None
+        if has_product_checkout(checkout) and (
+            isinstance(checkout_update, CheckoutConfirm)
+            or "custom_field_data" in checkout_update.model_fields_set
         ):
             custom_field_data = validate_custom_field_data(
                 checkout.product.attached_custom_fields,
                 checkout_update.custom_field_data,
                 validate_required=isinstance(checkout_update, CheckoutConfirm),
             )
-            checkout.custom_field_data = custom_field_data
+            if isinstance(checkout_update, CheckoutConfirm):
+                checkout.custom_field_data = custom_field_data
+            else:
+                checkout.custom_field_data = {
+                    **(checkout.custom_field_data or {}),
+                    **custom_field_data,
+                }
 
         ip_country = self._get_ip_country(
             ip_geolocation_client, checkout.customer_ip_address
@@ -2216,9 +2314,31 @@ class CheckoutService:
 
         session.add(checkout)
 
+        # Tell the buyer as soon as they apply the code, instead of letting them fill in
+        # the payment form first. Confirmation re-checks with the card fingerprint, which
+        # isn't available yet, so it stays the authoritative gate.
+        if (
+            isinstance(checkout_update, CheckoutUpdatePublic)
+            and not isinstance(checkout_update, CheckoutConfirmBase)
+            and checkout.discount is not None
+            and await discount_service.check_per_customer_limit_reached(
+                session, checkout.discount, checkout=checkout
+            )
+        ):
+            raise DiscountRedemptionLimitReached(checkout)
+
         await self._validate_subscription_uniqueness(session, checkout)
 
         return checkout
+
+    def _reset_payment_form_fields_if_needed(self, checkout: Checkout) -> None:
+        # Reset payment form fields if it's no longer required
+        # This handles the case where a 100% discount is applied and the
+        # payment and billing address sections disappear from the frontend
+        if not checkout.is_payment_form_required:
+            checkout.payment_method_type = None
+            if not checkout.require_billing_address:
+                checkout.is_business_customer = False
 
     async def _update_price(
         self,
@@ -2630,12 +2750,15 @@ class CheckoutService:
                 stripe_customer_id, tax_id=tax_id, **update_params
             )
 
-        # Only populate customer.name when creating a new customer. For existing
-        # customers (linked via customer_id or matched by email),
-        # checkout.customer_name may be the cardholder name on a wallet/payment
-        # method — e.g. a CFO or office manager paying on behalf of a company
-        # customer — and must not overwrite the company's name.
-        if created and customer_name is not None:
+        # Populate customer.name when it's not already set, even for existing
+        # customers (linked via customer_id or matched by email). We only avoid
+        # *overwriting* an existing name: checkout.customer_name may be the
+        # cardholder name on a wallet/payment method — e.g. a CFO or office
+        # manager paying on behalf of a company customer — and must not clobber
+        # the company's name. But an existing customer with no name at all
+        # (e.g. created through the API without one) should still get an initial
+        # value so invoices can be generated.
+        if customer.name is None and customer_name is not None:
             customer.name = customer_name
         if checkout.customer_billing_name is not None:
             customer.billing_name = checkout.customer_billing_name

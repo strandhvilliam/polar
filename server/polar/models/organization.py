@@ -1,6 +1,16 @@
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, Self, TypedDict
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    NotRequired,
+    Self,
+    TypedDict,
+    cast,
+)
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -8,6 +18,7 @@ from pydantic.json_schema import WithJsonSchema
 from sqlalchemy import (
     TIMESTAMP,
     BigInteger,
+    Boolean,
     CheckConstraint,
     ColumnElement,
     ForeignKey,
@@ -33,6 +44,7 @@ from polar.exceptions import PolarError
 from polar.kit.currency import PresentmentCurrency
 from polar.kit.db.models import RateLimitGroupMixin, RecordModel
 from polar.kit.extensions.sqlalchemy import StringEnum
+from polar.kit.utils import utc_now
 
 from .account import Account
 
@@ -89,31 +101,36 @@ class OrganizationSubscriptionSettings(TypedDict):
     allow_customer_updates: bool
 
 
-_default_subscription_settings: OrganizationSubscriptionSettings = {
-    "allow_multiple_subscriptions": False,
-    "allow_customer_updates": True,
-    "proration_behavior": SubscriptionProrationBehavior.prorate,
-    "benefit_revocation_grace_period": 0,
-    "prevent_trial_abuse": False,
-}
+def _default_subscription_settings() -> OrganizationSubscriptionSettings:
+    return {
+        "allow_multiple_subscriptions": False,
+        "allow_customer_updates": True,
+        "proration_behavior": SubscriptionProrationBehavior.prorate,
+        "benefit_revocation_grace_period": 0,
+        "prevent_trial_abuse": False,
+    }
 
 
 class OrganizationOrderSettings(TypedDict):
     invoice_numbering: InvoiceNumbering
 
 
-_default_order_settings: OrganizationOrderSettings = {
-    "invoice_numbering": InvoiceNumbering.customer,
-}
+def _default_order_settings() -> OrganizationOrderSettings:
+    return {
+        "invoice_numbering": InvoiceNumbering.customer,
+    }
 
 
 class OrganizationCustomerEmailSettings(TypedDict):
     order_confirmation: bool
+    payment_method_expiration_reminder: bool
     subscription_cancellation: bool
     subscription_confirmation: bool
     subscription_cycled: bool
     subscription_cycled_after_trial: bool
     subscription_past_due: bool
+    subscription_paused: bool
+    subscription_resumed: bool
     subscription_renewal_reminder: bool
     subscription_revoked: bool
     subscription_trial_conversion_reminder: bool
@@ -121,19 +138,37 @@ class OrganizationCustomerEmailSettings(TypedDict):
     subscription_updated: bool
 
 
-_default_customer_email_settings: OrganizationCustomerEmailSettings = {
-    "order_confirmation": True,
-    "subscription_cancellation": True,
-    "subscription_confirmation": True,
-    "subscription_cycled": True,
-    "subscription_cycled_after_trial": True,
-    "subscription_past_due": True,
-    "subscription_renewal_reminder": True,
-    "subscription_revoked": True,
-    "subscription_trial_conversion_reminder": True,
-    "subscription_uncanceled": True,
-    "subscription_updated": True,
-}
+def _default_customer_email_settings() -> OrganizationCustomerEmailSettings:
+    return {
+        "order_confirmation": True,
+        "payment_method_expiration_reminder": True,
+        "subscription_cancellation": True,
+        "subscription_confirmation": True,
+        "subscription_cycled": True,
+        "subscription_cycled_after_trial": True,
+        "subscription_past_due": True,
+        "subscription_paused": True,
+        "subscription_resumed": True,
+        "subscription_renewal_reminder": True,
+        "subscription_revoked": True,
+        "subscription_trial_conversion_reminder": True,
+        "subscription_uncanceled": True,
+        "subscription_updated": True,
+    }
+
+
+def resolve_default_customer_email_settings(
+    stored: Mapping[str, Any],
+) -> OrganizationCustomerEmailSettings:
+    """Complete stored settings with defaults so reads tolerate keys added after
+    an organization's settings were last written (lazy materialization)."""
+    defaults = _default_customer_email_settings()
+    # Default payment_method_expiration_reminder to the value of
+    # subscription_cycled for graceful rollout
+    defaults["payment_method_expiration_reminder"] = bool(
+        stored.get("subscription_cycled", defaults["subscription_cycled"])
+    )
+    return cast(OrganizationCustomerEmailSettings, {**defaults, **stored})
 
 
 class CustomerPortalUsageSettings(TypedDict):
@@ -143,6 +178,7 @@ class CustomerPortalUsageSettings(TypedDict):
 class CustomerPortalSubscriptionSettings(TypedDict):
     update_seats: bool
     update_plan: bool
+    pause: NotRequired[bool]
 
 
 class CustomerPortalCustomerSettings(TypedDict):
@@ -155,25 +191,47 @@ class OrganizationCustomerPortalSettings(TypedDict):
     customer: NotRequired[CustomerPortalCustomerSettings]
 
 
-_default_customer_portal_settings: OrganizationCustomerPortalSettings = {
-    "usage": {"show": True},
-    "subscription": {
-        "update_seats": True,
-        "update_plan": True,
-    },
-    "customer": {
-        "allow_email_change": False,
-    },
-}
+def _default_customer_portal_settings() -> OrganizationCustomerPortalSettings:
+    return {
+        "usage": {"show": True},
+        "subscription": {
+            "update_seats": True,
+            "update_plan": True,
+        },
+        "customer": {
+            "allow_email_change": False,
+        },
+    }
 
 
 class OrganizationCheckoutSettings(TypedDict):
     require_3ds: bool
 
 
-_default_checkout_settings: OrganizationCheckoutSettings = {
-    "require_3ds": True,
-}
+# Organizations created from this point must list their embed hosts.
+EMBED_HOSTS_ENFORCED_FROM = datetime(2026, 8, 4, tzinfo=UTC)
+
+# From this point every organization must, whenever it was created. Noon rather
+# than midnight so it lands on 17 August across most of the world.
+EMBED_HOSTS_ENFORCED_FOR_ALL = datetime(2026, 8, 17, 12, tzinfo=UTC)
+
+
+def _default_checkout_settings() -> OrganizationCheckoutSettings:
+    return {
+        "require_3ds": True,
+    }
+
+
+class OrganizationDisputeSettings(TypedDict):
+    auto_accept_below_amount: int | None
+    auto_accept_currency: str | None
+
+
+def _default_dispute_settings() -> OrganizationDisputeSettings:
+    return {
+        "auto_accept_below_amount": None,
+        "auto_accept_currency": None,
+    }
 
 
 class OrganizationIndividualLegalEntity(TypedDict):
@@ -198,6 +256,7 @@ class OrganizationStatus(StrEnum):
     ACTIVE = "active"
     BLOCKED = "blocked"
     OFFBOARDING = "offboarding"
+    OFFBOARDED = "offboarded"
 
     def get_display_name(self) -> str:
         return {
@@ -208,6 +267,7 @@ class OrganizationStatus(StrEnum):
             OrganizationStatus.ACTIVE: "Active",
             OrganizationStatus.BLOCKED: "Blocked",
             OrganizationStatus.OFFBOARDING: "Offboarding",
+            OrganizationStatus.OFFBOARDED: "Offboarded",
         }[self]
 
     @classmethod
@@ -333,6 +393,16 @@ STATUS_CAPABILITIES: dict[OrganizationStatus, OrganizationCapabilities] = {
         "api_access": True,
         "dashboard_access": True,
     },
+    # Terminal wind-down: new payments are blocked, but payouts are released so
+    # the merchant can withdraw their remaining balance (auto-processed, not held).
+    OrganizationStatus.OFFBOARDED: {
+        "checkout_payments": False,
+        "subscription_renewals": False,
+        "payouts": True,
+        "refunds": False,
+        "api_access": True,
+        "dashboard_access": True,
+    },
     OrganizationStatus.BLOCKED: {
         "checkout_payments": False,
         "subscription_renewals": False,
@@ -387,6 +457,7 @@ ALLOWED_STATUS_TRANSITIONS: dict[OrganizationStatus, frozenset[OrganizationStatu
     ),
     OrganizationStatus.REVIEW: frozenset(
         {
+            OrganizationStatus.CREATED,
             OrganizationStatus.ACTIVE,
             OrganizationStatus.SNOOZED,
             OrganizationStatus.DENIED,
@@ -396,6 +467,7 @@ ALLOWED_STATUS_TRANSITIONS: dict[OrganizationStatus, frozenset[OrganizationStatu
     ),
     OrganizationStatus.SNOOZED: frozenset(
         {
+            OrganizationStatus.CREATED,
             OrganizationStatus.REVIEW,
             OrganizationStatus.ACTIVE,
             OrganizationStatus.DENIED,
@@ -404,6 +476,7 @@ ALLOWED_STATUS_TRANSITIONS: dict[OrganizationStatus, frozenset[OrganizationStatu
     ),
     OrganizationStatus.ACTIVE: frozenset(
         {
+            OrganizationStatus.CREATED,
             OrganizationStatus.REVIEW,
             OrganizationStatus.DENIED,
             OrganizationStatus.BLOCKED,
@@ -413,6 +486,7 @@ ALLOWED_STATUS_TRANSITIONS: dict[OrganizationStatus, frozenset[OrganizationStatu
         {
             OrganizationStatus.CREATED,
             OrganizationStatus.ACTIVE,
+            OrganizationStatus.OFFBOARDING,
             OrganizationStatus.BLOCKED,
         }
     ),
@@ -420,6 +494,13 @@ ALLOWED_STATUS_TRANSITIONS: dict[OrganizationStatus, frozenset[OrganizationStatu
         {
             OrganizationStatus.REVIEW,
             OrganizationStatus.DENIED,
+            OrganizationStatus.BLOCKED,
+            OrganizationStatus.OFFBOARDED,
+        }
+    ),
+    # Terminal state: only a block escape hatch remains.
+    OrganizationStatus.OFFBOARDED: frozenset(
+        {
             OrganizationStatus.BLOCKED,
         }
     ),
@@ -484,6 +565,9 @@ class Organization(RateLimitGroupMixin, RecordModel):
         JSONB, nullable=False, default=dict
     )
     details_submitted_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True)
+    )
+    onboarding_resubmission_requested_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True)
     )
 
@@ -590,6 +674,23 @@ class Organization(RateLimitGroupMixin, RecordModel):
         JSONB, nullable=False, default=_default_checkout_settings
     )
 
+    dispute_settings: Mapped[OrganizationDisputeSettings] = mapped_column(
+        JSONB, nullable=False, default=_default_dispute_settings
+    )
+
+    embed_hosts: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+
+    @property
+    def embed_hosts_enforced(self) -> bool:
+        """Configuring a list does not enforce it. Merchants were emailed ahead
+        of the date it starts applying to everyone; until then, only
+        organizations young enough to have never embedded unchecked are held to
+        their list."""
+        return (
+            utc_now() >= EMBED_HOSTS_ENFORCED_FOR_ALL
+            or self.created_at >= EMBED_HOSTS_ENFORCED_FROM
+        )
+
     legal_entity: Mapped[OrganizationLegalEntity | None] = mapped_column(
         JSONB, nullable=True, default=None
     )
@@ -609,6 +710,20 @@ class Organization(RateLimitGroupMixin, RecordModel):
     @property
     def is_member_model_enabled(self) -> bool:
         return self.feature_settings.get("member_model_enabled", False)
+
+    @property
+    def is_sso_enabled(self) -> bool:
+        return self.feature_settings.get("sso_enabled", False)
+
+    @property
+    def is_compass_enabled(self) -> bool:
+        return self.feature_settings.get("compass_enabled", False)
+
+    @property
+    def is_merchant_migration_enabled(self) -> bool:
+        return self.feature_settings.get("merchant_migration_enabled", False)
+
+    sso_enforced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     #
     # Currency and tax settings
@@ -782,8 +897,20 @@ class Organization(RateLimitGroupMixin, RecordModel):
         )
 
     @property
+    def customer_portal_subscription_pause(self) -> bool:
+        return self.customer_portal_settings.get("subscription", {}).get("pause", False)
+
+    @property
     def checkout_require_3ds(self) -> bool:
         return self.checkout_settings.get("require_3ds", False)
+
+    @property
+    def dispute_auto_accept_below_amount(self) -> int | None:
+        return self.dispute_settings["auto_accept_below_amount"]
+
+    @property
+    def dispute_auto_accept_currency(self) -> str | None:
+        return self.dispute_settings["auto_accept_currency"]
 
     @declared_attr
     def all_products(cls) -> Mapped[list["Product"]]:
@@ -805,12 +932,20 @@ class Organization(RateLimitGroupMixin, RecordModel):
 
     @declared_attr
     def review(cls) -> Mapped["OrganizationReview | None"]:
+        # The single live review. A partial unique index guarantees at most one
+        # row per organization with deleted_at IS NULL, so a soft-deleted prior
+        # review (e.g. a reset grandfathered one) never shadows the live one.
         return relationship(
             "OrganizationReview",
             lazy="raise",
-            back_populates="organization",
-            cascade="delete, delete-orphan",
-            uselist=False,  # This makes it a one-to-one relationship
+            uselist=False,
+            viewonly=True,
+            primaryjoin=(
+                "and_("
+                "OrganizationReview.organization_id == Organization.id, "
+                "OrganizationReview.deleted_at.is_(None)"
+                ")"
+            ),
         )
 
     @declared_attr
@@ -834,8 +969,13 @@ class Organization(RateLimitGroupMixin, RecordModel):
     def is_blocked(self) -> bool:
         return self.status == OrganizationStatus.BLOCKED
 
-    def is_active(self) -> bool:
-        return self.status == OrganizationStatus.ACTIVE
+    def can_change_plan(self) -> bool:
+        # Active organizations and organizations under silent review (review or
+        # snoozed) may change their plan; all other statuses are blocked.
+        return (
+            self.status == OrganizationStatus.ACTIVE
+            or self.status in OrganizationStatus.review_statuses()
+        )
 
     def statement_descriptor(self, suffix: str = "") -> str:
         max_length = settings.stripe_descriptor_suffix_max_length

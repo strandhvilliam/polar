@@ -42,6 +42,7 @@ from .schemas import (
 )
 from .service import (
     AlreadyActiveSubscriptionError,
+    DiscountRedemptionLimitReached,
     ExpiredCheckoutError,
     NotOpenCheckout,
     PaymentError,
@@ -74,7 +75,8 @@ CheckoutForbiddenError = {
         AlreadyActiveSubscriptionError.schema()
         | NotOpenCheckout.schema()
         | PaymentNotReady.schema()
-        | TrialAlreadyRedeemed.schema(),
+        | TrialAlreadyRedeemed.schema()
+        | DiscountRedemptionLimitReached.schema(),
         SetSchemaReference("CheckoutForbiddenError"),
     ],
 }
@@ -187,7 +189,9 @@ async def update(
     session: AsyncSession = Depends(get_db_session),
 ) -> Checkout:
     """Update a checkout session."""
-    checkout = await checkout_service.get_by_id(session, auth_subject, id)
+    checkout = await checkout_service.get_by_id(
+        session, auth_subject, id, for_update=True
+    )
 
     if checkout is None:
         raise ResourceNotFound()
@@ -233,7 +237,9 @@ async def client_update(
     session: AsyncSession = Depends(get_db_session),
 ) -> Checkout:
     """Update a checkout session by client secret."""
-    checkout = await checkout_service.get_by_client_secret(session, client_secret)
+    checkout = await checkout_service.get_by_client_secret(
+        session, client_secret, for_update=True
+    )
 
     return await checkout_service.update(
         session, checkout, checkout_update, ip_geolocation_client
@@ -263,7 +269,9 @@ async def client_confirm(
 
     Orders and subscriptions will be processed.
     """
-    checkout = await checkout_service.get_by_client_secret(session, client_secret)
+    checkout = await checkout_service.get_by_client_secret(
+        session, client_secret, for_update=True
+    )
 
     return await checkout_service.confirm(
         session, auth_subject, checkout, checkout_confirm

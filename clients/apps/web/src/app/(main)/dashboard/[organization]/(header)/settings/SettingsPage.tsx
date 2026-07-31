@@ -6,6 +6,7 @@ import FeatureSettings from '@/components/Settings/FeatureSettings'
 import OrganizationAccessTokensSettings from '@/components/Settings/OrganizationAccessTokensSettings'
 import OrganizationCustomerEmailSettings from '@/components/Settings/OrganizationCustomerEmailSettings'
 import OrganizationCustomerPortalSettings from '@/components/Settings/OrganizationCustomerPortalSettings'
+import OrganizationEmbedSettings from '@/components/Settings/OrganizationEmbedSettings'
 import OrganizationDeleteSettings from '@/components/Settings/OrganizationDeleteSettings'
 import OrganizationNotificationSettings from '@/components/Settings/OrganizationNotificationSettings'
 import OrganizationPaymentSettings from '@/components/Settings/OrganizationPaymentSettings'
@@ -16,7 +17,7 @@ import { useHasPermission } from '@/hooks/permissions'
 import { useUserOrganizationNotificationSettings } from '@/hooks/queries/user_organizations'
 import { CONFIG } from '@/utils/config'
 import { schemas } from '@polar-sh/client'
-import Alert from '@polar-sh/ui/components/atoms/Alert'
+import { Alert } from '@polar-sh/orbit'
 import Link from 'next/link'
 
 export default function ClientPage({
@@ -66,24 +67,41 @@ export default function ClientPage({
           />
         </Section>
 
+        <Section id="embedding">
+          <SectionDescription
+            title="Embedding"
+            description="Hosts allowed to embed your checkout"
+          />
+          <OrganizationEmbedSettings
+            organization={org}
+            readOnly={!canManageOrganization}
+          />
+        </Section>
+
         <Section id="customer_emails">
           <SectionDescription
             title="Customer notifications"
             description="Emails automatically sent to customers for purchases, renewals, and other subscription lifecycle events"
           />
           {CONFIG.IS_SANDBOX && (
-            <Alert color="yellow" className="p-3 px-4 text-sm">
-              In sandbox, customer-facing emails are only delivered to{' '}
-              <Link
-                href="./members"
-                className="font-medium underline hover:no-underline"
-              >
-                members of your organization
-              </Link>
-              . Sub-addressing aliases like{' '}
-              <strong className="font-medium">you+test@example.com</strong> are
-              accepted.
-            </Alert>
+            <Alert
+              variant="warning"
+              title="Sandbox notice"
+              description={
+                <>
+                  In sandbox, customer-facing emails are only delivered to{' '}
+                  <Link
+                    href="./members"
+                    className="font-medium underline hover:no-underline"
+                  >
+                    members of your organization
+                  </Link>
+                  . Sub-addressing aliases like{' '}
+                  <strong className="font-medium">you+test@example.com</strong>{' '}
+                  are accepted.
+                </>
+              }
+            />
           )}
           <OrganizationCustomerEmailSettings
             organization={org}
@@ -110,16 +128,21 @@ export default function ClientPage({
             description="Manage alpha & beta features for your organization"
           />
           {CONFIG.IS_SANDBOX && (
-            <Alert color="gray" className="p-3 px-4 text-sm">
-              To enable paid access to preview features in sandbox, go to{' '}
-              <Link
-                href="./billing"
-                className="font-medium underline hover:no-underline"
-              >
-                Settings → Billing
-              </Link>
-              .
-            </Alert>
+            <Alert
+              title="Preview features in sandbox"
+              description={
+                <>
+                  To enable paid access to preview features in sandbox, go to{' '}
+                  <Link
+                    href="./billing"
+                    className="font-medium underline hover:no-underline"
+                  >
+                    Settings → Billing
+                  </Link>
+                  .
+                </>
+              }
+            />
           )}
           <FeatureSettings
             organization={org}

@@ -147,7 +147,7 @@ async def list(
     request: Request,
     pagination: PaginationParamsQuery,
     sorting: ListSorting,
-    query: str | None = Query(None),
+    query: Annotated[str | None, BeforeValidator(empty_str_to_none), Query()] = None,
     status: Annotated[
         PayoutStatus | None,
         BeforeValidator(empty_str_to_none),
@@ -229,7 +229,7 @@ async def list(
                                 for status in PayoutStatus
                             ],
                         ],
-                        status[0] if status else "",
+                        status.value if status else "",
                         name="status",
                     ):
                         pass
@@ -277,7 +277,10 @@ async def get(
     if payout is None:
         raise HTTPException(status_code=404)
 
-    can_retry = payout.status != PayoutStatus.canceled and (
+    can_retry = payout.status not in (
+        PayoutStatus.canceled,
+        PayoutStatus.held,
+    ) and (
         payout.status == PayoutStatus.failed
         or len(payout.attempts) == 0
         or sum(
@@ -418,6 +421,12 @@ async def retry(
         raise HTTPException(
             status_code=400,
             detail="Cannot retry a canceled payout.",
+        )
+
+    if payout.status == PayoutStatus.held:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot retry a held payout while the organization is under review.",
         )
 
     remaining_amount = payout.account_amount - sum(
@@ -576,7 +585,7 @@ async def cancel(
             with tag.div(classes="modal-action"):
                 with tag.form(method="dialog"):
                     with button(ghost=True):
-                        text("Cancel")
+                        text("Go back")
                 with tag.form(method="dialog"):
                     with button(
                         type="button",
@@ -584,7 +593,7 @@ async def cancel(
                         hx_post=str(request.url_for("payouts:cancel", id=payout.id)),
                         hx_target="#modal",
                     ):
-                        text("Cancel")
+                        text("Cancel Payout")
 
 
 @router.post("/{id}/refresh", name="payouts:refresh")

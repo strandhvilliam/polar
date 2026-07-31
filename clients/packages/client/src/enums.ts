@@ -1,6 +1,5 @@
 export {
   addressInputCountryValues,
-  appealDecisionValues,
   availableScopeValues,
   benefitGitHubRepositoryPropertiesPermissionValues,
   benefitTypeValues,
@@ -8,6 +7,7 @@ export {
   countAggregationFuncValues,
   customFieldTypeValues,
   meterUnitValues,
+  orderStatusValues,
   presentmentCurrencyValues,
   propertyAggregationFuncValues,
   refundReasonValues,
